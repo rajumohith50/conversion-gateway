@@ -1,0 +1,23 @@
+# Local stack. One command brings up everything the gateway needs.
+# Phase 1 ships only Postgres so that `make run` / `make down` work from the
+# start; later phases add the queue, the gateway, the worker and the mock ads
+# API to this file.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:

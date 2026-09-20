@@ -1,7 +1,6 @@
 """Email normalisation. Design section 5, "Email"."""
 
-from gateway.normalise.errors import NormalisationError
-from gateway.normalise.hashing import sha256_hex
+from gateway.normalise.rejection import RejectionReason
 
 # Google-hosted mailboxes ignore dots in the local part and everything after
 # a "+". "m.ohith+ads@gmail.com" and "mohith@gmail.com" are the same inbox, so
@@ -11,30 +10,28 @@ from gateway.normalise.hashing import sha256_hex
 _DOT_INSENSITIVE_DOMAINS = frozenset({"gmail.com", "googlemail.com"})
 
 
-def normalise_email(raw: str) -> str:
-    """Return the canonical form of an email address.
+def normalise_email(raw: str | None) -> str | RejectionReason:
+    """Return the canonical form of an email address, or why it was rejected.
 
-    Raises NormalisationError if the input is not shaped like an address.
     We only check for exactly one "@" with non-empty sides; full RFC 5322
     validation would reject real addresses that platforms happily match on.
     """
+    if raw is None:
+        return RejectionReason.MISSING
+
     value = raw.strip().lower()
     if not value:
-        raise NormalisationError("email", "empty")
+        return RejectionReason.EMPTY
 
     local, sep, domain = value.partition("@")
     if not sep or not local or not domain or "@" in domain:
-        raise NormalisationError("email", "malformed")
+        return RejectionReason.MALFORMED
 
     if domain in _DOT_INSENSITIVE_DOMAINS:
         local = local.replace(".", "")
         local = local.split("+", 1)[0]
         if not local:
             # "+tag@gmail.com" or "...@gmail.com": nothing left to match on.
-            raise NormalisationError("email", "malformed")
+            return RejectionReason.MALFORMED
 
     return f"{local}@{domain}"
-
-
-def hash_email(raw: str) -> str:
-    return sha256_hex(normalise_email(raw))

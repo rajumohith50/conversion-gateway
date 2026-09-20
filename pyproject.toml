@@ -25,6 +25,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
@@ -40,6 +41,18 @@ packages = ["src/gateway"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Coverage on every run, failing under the floor. The floor is high because
+# the core of this system is pure functions with fixture tables; if it drops,
+# something was added without its table.
+addopts = "--cov=gateway --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["src/gateway"]
+branch = true
+
+[tool.coverage.report]
+skip_empty = true
+exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.ruff]
 line-length = 100
@@ -47,6 +60,11 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The fixture tables hold a 64-char literal digest per row. One row per line
+# is what makes them readable as a spec, so line length does not apply there.
+"tests/normalise/test_normalise.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"

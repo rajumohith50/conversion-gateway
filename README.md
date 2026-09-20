@@ -10,7 +10,7 @@ The full technical design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 Built in phases. Currently implemented:
 
-- [x] Phase 1: project scaffold, normalisation + hashing, consent gate
+- [x] Phase 1: project skeleton, normalisation + hashing, consent gate
 - [ ] Phase 2: event ledger (Postgres, SQLAlchemy, Alembic)
 - [ ] Phase 3: ingest API (signature verification, schema validation, dedupe)
 - [ ] Phase 4: queue, processor, upload client, mock ads API
@@ -21,7 +21,12 @@ Built in phases. Currently implemented:
 
 ```
 make install   # uv sync
-make test      # pytest
-make lint      # ruff
+make test      # pytest with coverage (floor: 90%)
+make lint      # ruff check + format check
 make typecheck # mypy --strict
+make run       # docker compose up (local stack)
+make down      # docker compose down, removing volumes
 ```
+
+Copy `.env.example` to `.env` before running the stack; every variable is
+documented there with the phase that introduces it.
