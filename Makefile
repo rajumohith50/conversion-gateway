@@ -1,10 +1,12 @@
-.PHONY: install test lint typecheck fmt run down migrate api
+.PHONY: install test lint typecheck fmt run down migrate api worker queue-init reconcile
 
 install:
 	uv sync
 
+# PUBSUB_EMULATOR_HOST makes the Pub/Sub adapter tests run against the
+# emulator from `make run`; unset, they are skipped.
 test:
-	uv run pytest
+	PUBSUB_EMULATOR_HOST=localhost:8085 uv run pytest
 
 lint:
 	uv run ruff check src tests
@@ -32,3 +34,14 @@ migrate:
 # Serve the ingest API locally against the compose Postgres.
 api:
 	uv run uvicorn gateway.api.app:create_app_from_env --factory --host 0.0.0.0 --port 8080 --reload
+
+# Create the Pub/Sub topic and subscription on the emulator. Rerun after
+# `make down`; the emulator has no persistence.
+queue-init:
+	uv run gateway queue-init
+
+worker:
+	uv run gateway worker
+
+reconcile:
+	uv run gateway reconcile

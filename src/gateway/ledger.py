@@ -7,6 +7,7 @@ than calling datetime.now() so tests can pin timestamps.
 """
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -77,7 +78,11 @@ def _insert_if_absent(session: Session, row: dict[str, object]) -> bool:
 
 
 def record_validated(session: Session, event: CanonicalLeadEvent, now: datetime) -> Event | None:
-    """Persist a freshly validated event as RECEIVED -> VALIDATED.
+    """Persist a freshly validated event as RECEIVED -> VALIDATED -> QUEUED.
+
+    All three states land in one transaction. VALIDATED is never a resting
+    state in practice, but recording it keeps the audit trail honest about
+    the steps the event went through.
 
     Returns the new Event, or None if this event_id was already in the
     ledger (a duplicate delivery). On None the caller must not write
@@ -121,6 +126,7 @@ def record_validated(session: Session, event: CanonicalLeadEvent, now: datetime)
         )
     )
     transition(session, row, EventStatus.VALIDATED, None, now)
+    transition(session, row, EventStatus.QUEUED, None, now)
     return row
 
 
@@ -157,6 +163,28 @@ def record_rejected(
     )
     transition(session, row, EventStatus.REJECTED, reason, now)
     return row
+
+
+def record_processed(
+    session: Session, event: Event, hashed_identifiers: dict[str, Any], now: datetime
+) -> None:
+    """The worker's happy path: digests written, event moves to PROCESSED.
+    This is the only function that writes hashed_identifiers."""
+    event.hashed_identifiers = hashed_identifiers
+    transition(session, event, EventStatus.PROCESSED, None, now)
+
+
+def find_stuck_queued(session: Session, older_than: datetime) -> list[Event]:
+    """Events that were marked QUEUED before `older_than` and are still
+    QUEUED. With a healthy worker the queue drains in seconds, so anything
+    past a sensible threshold most likely never made it onto the queue
+    (publish failed after the ledger commit). The reconcile CLI uses this."""
+    stmt = (
+        select(Event)
+        .where(Event.status == EventStatus.QUEUED.value, Event.received_at < older_than)
+        .order_by(Event.received_at)
+    )
+    return list(session.scalars(stmt))
 
 
 def list_transitions(session: Session, event_id: str) -> list[EventTransition]:

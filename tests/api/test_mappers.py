@@ -130,3 +130,14 @@ def test_rejection_reasons_contain_locations_and_types_but_no_values() -> None:
     )
     assert "secret-value-yes" not in str(reasons)
     assert "Gmail.com" not in str(reasons)
+
+
+def test_blank_strings_are_absent_not_empty() -> None:
+    # CRMs send "" for fields the user left blank. Absent (None) is the
+    # normaliser's "not provided"; "" would be a rejection.
+    payload = salesforce_payload()
+    payload["Lead"]["Phone"] = ""
+    payload["Lead"]["Street"] = "   "
+    event = mappers.parse_and_map(Source.SALESFORCE, payload)
+    assert event.identifiers.phone is None
+    assert event.identifiers.street_address is None

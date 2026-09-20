@@ -22,6 +22,15 @@ def make_event_id(source: Source, source_event_id: str) -> str:
     return f"{source.value}:{source_event_id}"
 
 
+def _present(value: str | None) -> str | None:
+    """CRMs send "" for a field the user left blank. That means "not
+    provided", which the normaliser represents as None, not as an empty
+    value to be rejected."""
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 def map_salesforce(payload: SalesforceWebhook) -> CanonicalLeadEvent:
     lead = payload.lead
     return CanonicalLeadEvent(
@@ -34,15 +43,15 @@ def map_salesforce(payload: SalesforceWebhook) -> CanonicalLeadEvent:
         currency=payload.currency,
         click_id=lead.gclid or None,
         identifiers=RawIdentifiers(
-            email=lead.email,
-            phone=lead.phone,
-            given_name=lead.first_name,
-            family_name=lead.last_name,
-            street_address=lead.street,
-            city=lead.city,
-            region=lead.state_code,
-            postal_code=lead.postal_code,
-            country=lead.country_code,
+            email=_present(lead.email),
+            phone=_present(lead.phone),
+            given_name=_present(lead.first_name),
+            family_name=_present(lead.last_name),
+            street_address=_present(lead.street),
+            city=_present(lead.city),
+            region=_present(lead.state_code),
+            postal_code=_present(lead.postal_code),
+            country=_present(lead.country_code),
         ),
         consent=ConsentSignals(
             ad_user_data=lead.consent_ad_user_data,
@@ -64,15 +73,15 @@ def map_hubspot(payload: HubSpotWebhook) -> CanonicalLeadEvent:
         currency=props.deal_currency_code,
         click_id=props.hs_google_click_id or None,
         identifiers=RawIdentifiers(
-            email=props.email,
-            phone=props.phone,
-            given_name=props.firstname,
-            family_name=props.lastname,
-            street_address=props.address,
-            city=props.city,
-            region=props.state,
-            postal_code=props.zip,
-            country=props.country,
+            email=_present(props.email),
+            phone=_present(props.phone),
+            given_name=_present(props.firstname),
+            family_name=_present(props.lastname),
+            street_address=_present(props.address),
+            city=_present(props.city),
+            region=_present(props.state),
+            postal_code=_present(props.zip),
+            country=_present(props.country),
         ),
         consent=ConsentSignals(
             ad_user_data=props.ad_user_data_consent,

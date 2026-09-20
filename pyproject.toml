@@ -17,6 +17,7 @@ dependencies = [
     "structlog>=24.4",
     "prometheus-client>=0.21",
     "uvicorn[standard]>=0.30",
+    "google-cloud-pubsub>=2.41.0",
 ]
 
 [dependency-groups]
@@ -27,6 +28,9 @@ dev = [
     "mypy>=1.11",
     "pytest-cov>=7.1.0",
 ]
+
+[project.scripts]
+gateway = "gateway.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -70,3 +74,9 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+# google-cloud-pubsub ships no py.typed marker. Everything that touches it
+# is confined to gateway/queue/pubsub.py, so the untyped surface is small.
+module = ["google.*"]
+ignore_missing_imports = true

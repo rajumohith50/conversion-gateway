@@ -46,8 +46,8 @@ flowchart LR
     classDef planned fill:#5b5f66,stroke:#2f3236,color:#ffffff,stroke-dasharray:4 3
     classDef external fill:#2b4c7e,stroke:#16283f,color:#ffffff
 
-    class API,LEDGER,NORM,CONSENT built
-    class Q,W,UP,DLQ,REPLAY planned
+    class API,LEDGER,Q,W,NORM,CONSENT built
+    class UP,DLQ,REPLAY planned
     class CRM,ADS external
 ```
 
@@ -85,9 +85,50 @@ sequenceDiagram
     end
 ```
 
-Raw identifiers live only inside the request. The ledger row holds digests,
-consent state, and lifecycle; a test dumps every column and asserts the raw
-email, phone and name are absent.
+After the commit the API publishes `{event_id, raw identifiers}` to the
+queue. The raw identifiers exist only on that message and only until the
+worker hashes them; the ledger row holds digests, consent state, and
+lifecycle. A test dumps every column and asserts the raw email, phone and
+name are absent.
+
+## What the worker does
+
+```mermaid
+flowchart TD
+    Q[["Queue"]] -->|"receive()"| LOAD["Load ledger row by event_id"]
+    LOAD -->|"no row"| ORPHAN["ack: orphan message"]
+    LOAD -->|"status ≠ QUEUED"| DUP["ack: already handled<br/>(at-least-once redelivery)"]
+    LOAD -->|"QUEUED"| CONSENT{"both consent<br/>signals GRANTED?"}
+    CONSENT -->|no| SUP["SUPPRESSED<br/>reason = which signal, and whether<br/>denied / unspecified / absent"]
+    CONSENT -->|yes| NORM["build_user_identifiers()<br/>normalise + SHA-256 every field"]
+    NORM -->|"any field rejected"| REJ["REJECTED<br/>reason = 'unparseable:phone;…'"]
+    NORM -->|ok| PROC["PROCESSED<br/>digests written to ledger"]
+    SUP --> ACK["commit, then ack"]
+    REJ --> ACK
+    PROC --> ACK
+    ACK -.->|"exception anywhere"| NACK["rollback, nack → redeliver"]
+
+    classDef terminal fill:#5b5f66,stroke:#2f3236,color:#ffffff
+    classDef good fill:#1f6f43,stroke:#0e3d24,color:#ffffff
+    class SUP,REJ terminal
+    class PROC good
+```
+
+Consent is evaluated before the identifiers are touched, so a denied user's
+PII is never even normalised. Commit happens before ack, which is what makes
+delivery at-least-once: a crash between the two redelivers a message whose
+row is already `PROCESSED`, and the worker skips it.
+
+The transport is an interface ([`QueuePublisher` / `QueueConsumer`](src/gateway/queue/base.py))
+with two implementations: in-memory for tests, Google Cloud Pub/Sub (against
+the emulator locally) for anything with two processes. `QUEUE_BACKEND` picks
+one; nothing else changes.
+
+There is no transaction spanning Postgres and the queue, so the ledger
+commit goes first and the publish second. If the publish fails the event is
+durable but stuck in `QUEUED`; `gateway reconcile` finds those, re-enqueues
+the ones that can be recovered from the ledger alone (click-ID events), and
+names the ones that need a CRM resend.
 
 ## Event lifecycle
 
@@ -100,10 +141,11 @@ stateDiagram-v2
     [*] --> RECEIVED
     RECEIVED --> VALIDATED
     RECEIVED --> REJECTED: schema invalid
-    VALIDATED --> REJECTED: normalisation failed
-    VALIDATED --> SUPPRESSED: consent not granted
     VALIDATED --> QUEUED
-    QUEUED --> UPLOADING
+    QUEUED --> SUPPRESSED: consent not granted
+    QUEUED --> REJECTED: normalisation failed
+    QUEUED --> PROCESSED: digests persisted
+    PROCESSED --> UPLOADING
     UPLOADING --> UPLOADED
     UPLOADING --> FAILED_RETRYABLE: 429 / 5xx / timeout
     FAILED_RETRYABLE --> UPLOADING: backoff + jitter
@@ -131,6 +173,8 @@ These are the decisions the codebase exists to demonstrate.
 | **Replayable signatures.** A tolerance window on a timestamp header is bypassed by bumping the header. | The timestamp is inside the signed string. Bumping it invalidates the signature. |
 | **Rejections vanishing into a 4xx.** A client asks why conversions are missing and there is no record. | Authenticated-but-invalid requests are written as `REJECTED` with a structured reason and are queryable at `GET /events/{id}`. |
 | **PII in logs and errors.** Pydantic's validation errors include the offending input. | Error payloads carry only field path and error type. Rejection exceptions hold the field name, never the value. |
+| **Double-processing on redelivery.** At-least-once queues redeliver; a naive worker hashes and transitions twice. | The worker reads the ledger row first and skips anything not `QUEUED`. Commit-then-ack ordering means a crash never loses work, only repeats a no-op. |
+| **Lost messages with no trace.** Ledger commit and queue publish cannot share a transaction. | Commit first, publish second. A failed publish leaves a durable `QUEUED` row that `gateway reconcile` finds and, where the match key is on the row, re-enqueues. |
 
 ## Status
 
@@ -138,7 +182,7 @@ Built in phases, each committed separately.
 
 - [x] **Phase 1** — project skeleton, normalisation + hashing, consent gate
 - [x] **Phase 2** — ingest API and event ledger (HMAC verification, per-source schemas, idempotency, Alembic)
-- [ ] **Phase 3** — queue abstraction (in-memory + Pub/Sub emulator), processing worker, reconciliation CLI
+- [x] **Phase 3** — queue abstraction (in-memory + Pub/Sub emulator), processing worker, reconciliation CLI
 - [ ] **Phase 4** — upload client with error classification, backoff, partial-batch handling; mock ads API
 - [ ] **Phase 5** — dead-letter store and replay CLI
 - [ ] **Phase 6** — structured logging with PII redaction, Prometheus metrics, container, runbook
@@ -146,11 +190,14 @@ Built in phases, each committed separately.
 ## Running it
 
 ```
-make install   # uv sync
-make run       # docker compose up (Postgres)
-make migrate   # alembic upgrade head
-make api       # uvicorn on :8080
-make test      # pytest with coverage (floor: 90%); needs `make run`
+make install     # uv sync
+make run         # docker compose up (Postgres + Pub/Sub emulator)
+make migrate     # alembic upgrade head
+make queue-init  # create the Pub/Sub topic + subscription on the emulator
+make api         # uvicorn on :8080
+make worker      # gateway worker: consume, gate, hash, persist
+make reconcile   # gateway reconcile: list events stuck in QUEUED
+make test        # pytest with coverage (floor: 90%); needs `make run`
 make lint      # ruff check + format check
 make typecheck # mypy --strict
 make down      # docker compose down, removing volumes
@@ -177,6 +224,15 @@ X-Webhook-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>
 `GET /events/{event_id}` returns lifecycle state, reason, and every
 transition. `GET /healthz` is liveness; `GET /readyz` checks the database.
 
+### CLI
+
+```
+gateway worker                          # run the processor until SIGINT/SIGTERM
+gateway reconcile [--older-than 300]    # list QUEUED events with no progress; exit 1 if any
+gateway reconcile --republish           # also re-enqueue the click-ID ones
+gateway queue-init                      # create topic + subscription
+```
+
 ### Tests
 
 Tests run against the real Postgres from `make run`, in a separate
@@ -185,7 +241,7 @@ session. That is deliberate: the idempotency guarantee rests on Postgres'
 `ON CONFLICT` semantics, and the migration is code worth exercising.
 
 ```
-192 passed · 100% line and branch coverage · mypy --strict clean
+246 passed · 99% line and branch coverage · mypy --strict clean
 ```
 
 ## Layout
@@ -197,7 +253,11 @@ src/gateway/
 ├── normalise/      Pure normalisation and hashing; rejection reasons
 ├── consent/        Consent gate
 ├── ledger.py       All ledger writes; the only code that changes event state
-├── queue/          (phase 3)
+├── queue/          QueuePublisher / QueueConsumer; in-memory and Pub/Sub implementations
+├── processor.py    What happens to one queued event: consent, normalise, persist
+├── worker.py       The receive / process / ack loop
+├── cli.py          gateway worker | reconcile | queue-init
+├── wiring.py       Builds the queue objects Settings asks for
 ├── upload/         (phase 4)
 ├── dlq/            (phase 5)
 └── observability/  (phase 6)
@@ -209,4 +269,5 @@ docs/DESIGN.md      Technical design
 ## Stack
 
 Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · Alembic · Postgres ·
-phonenumbers · pytest · ruff · mypy --strict · uv · Docker Compose
+Google Cloud Pub/Sub · phonenumbers · pytest · ruff · mypy --strict · uv ·
+Docker Compose

@@ -8,6 +8,7 @@ request body is the only genuinely async operation here.
 
 import hashlib
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -21,7 +22,9 @@ from gateway.api import mappers
 from gateway.api.signature import verify
 from gateway.config import Settings
 from gateway.models.status import EventStatus, Source
+from gateway.queue import QueueMessage, QueuePublisher
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 TIMESTAMP_HEADER = "X-Webhook-Timestamp"
@@ -148,12 +151,29 @@ def ingest(
         row = ledger.record_validated(session, event, now)
         if row is None:
             # Duplicate delivery. 200 rather than 202: nothing new was
-            # accepted, and the client gets the id it already has.
+            # accepted, and the client gets the id it already has. No
+            # publish either: the original delivery already did that.
             response.status_code = status.HTTP_200_OK
             existing = ledger.get_event(session, event.event_id)
             assert existing is not None
             return AcceptedResponse(event_id=existing.event_id, status=EventStatus(existing.status))
-        return AcceptedResponse(event_id=row.event_id, status=EventStatus(row.status))
+        accepted = AcceptedResponse(event_id=row.event_id, status=EventStatus(row.status))
+
+    # Publish AFTER the commit. There is no transaction that spans Postgres
+    # and the queue, so one of the two must go first, and the durable one
+    # should: a row without a message is found by `gateway reconcile`,
+    # whereas a message without a row is an orphan the worker can only
+    # drop. The identifiers ride on the message and nowhere else.
+    publisher: QueuePublisher = request.app.state.publisher
+    try:
+        publisher.publish(
+            QueueMessage(event_id=event.event_id, identifiers=event.identifiers, enqueued_at=now)
+        )
+    except Exception:
+        # The event is durable and QUEUED; still 202. Logged at error level
+        # because a run of these means the queue is down, not the client.
+        log.exception("publish failed; event left QUEUED", extra={"event_id": event.event_id})
+    return accepted
 
 
 def _reject(

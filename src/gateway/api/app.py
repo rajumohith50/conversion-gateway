@@ -12,12 +12,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from gateway.api.routes import router
 from gateway.config import Settings
 from gateway.db import make_engine, make_session_factory
+from gateway.queue import QueuePublisher
+from gateway.wiring import make_publisher
 
 
-def create_app(settings: Settings, session_factory: sessionmaker[Session]) -> FastAPI:
+def create_app(
+    settings: Settings, session_factory: sessionmaker[Session], publisher: QueuePublisher
+) -> FastAPI:
     app = FastAPI(title="Conversion Gateway", version="0.1.0")
     app.state.settings = settings
     app.state.session_factory = session_factory
+    app.state.publisher = publisher
     app.include_router(router)
     return app
 
@@ -25,4 +30,5 @@ def create_app(settings: Settings, session_factory: sessionmaker[Session]) -> Fa
 def create_app_from_env() -> FastAPI:
     """Entry point for `uvicorn gateway.api.app:create_app_from_env --factory`."""
     settings = Settings()
-    return create_app(settings, make_session_factory(make_engine(settings.database_url)))
+    session_factory = make_session_factory(make_engine(settings.database_url))
+    return create_app(settings, session_factory, make_publisher(settings))

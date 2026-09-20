@@ -1,13 +1,20 @@
-"""Event lifecycle. Design section 4, plus REJECTED.
+"""Event lifecycle. Design section 4, plus REJECTED and PROCESSED.
 
-    RECEIVED -> VALIDATED -> {SUPPRESSED | QUEUED} -> UPLOADING
-             -> {UPLOADED | FAILED_RETRYABLE | DEAD_LETTERED}
+    RECEIVED -> VALIDATED -> QUEUED -> {SUPPRESSED | REJECTED | PROCESSED}
+    PROCESSED -> UPLOADING -> {UPLOADED | FAILED_RETRYABLE | DEAD_LETTERED}
     RECEIVED -> REJECTED
 
-REJECTED is not in the design's diagram. It is the terminal state for an
-event that authenticated but failed schema validation (phase 2) or
-normalisation (phase 3). The design says rejected events must be queryable,
-which means they need a row, which means they need a state.
+Two states are not in the design's diagram:
+
+REJECTED   terminal, for an event that authenticated but failed schema
+           validation (phase 2) or normalisation (phase 3). The design says
+           rejected events must be queryable, which means a row and a state.
+
+PROCESSED  the worker has gated consent, hashed the identifiers and written
+           the digests to the ledger; the event is waiting for the upload
+           stage (phase 4). From here on the ledger row is self-sufficient:
+           the raw identifiers are gone and the digests are durable, so a
+           crash between hashing and upload loses nothing.
 """
 
 from enum import StrEnum
@@ -17,8 +24,9 @@ class EventStatus(StrEnum):
     RECEIVED = "RECEIVED"
     VALIDATED = "VALIDATED"
     REJECTED = "REJECTED"
-    SUPPRESSED = "SUPPRESSED"
     QUEUED = "QUEUED"
+    SUPPRESSED = "SUPPRESSED"
+    PROCESSED = "PROCESSED"
     UPLOADING = "UPLOADING"
     UPLOADED = "UPLOADED"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
@@ -34,13 +42,12 @@ class EventStatus(StrEnum):
 # REJECTED and UPLOADED are truly terminal.
 ALLOWED_TRANSITIONS: dict[EventStatus, frozenset[EventStatus]] = {
     EventStatus.RECEIVED: frozenset({EventStatus.VALIDATED, EventStatus.REJECTED}),
-    EventStatus.VALIDATED: frozenset(
-        {EventStatus.SUPPRESSED, EventStatus.QUEUED, EventStatus.REJECTED}
+    EventStatus.VALIDATED: frozenset({EventStatus.QUEUED}),
+    EventStatus.QUEUED: frozenset(
+        {EventStatus.PROCESSED, EventStatus.SUPPRESSED, EventStatus.REJECTED}
     ),
     EventStatus.SUPPRESSED: frozenset({EventStatus.QUEUED}),
-    EventStatus.QUEUED: frozenset(
-        {EventStatus.UPLOADING, EventStatus.SUPPRESSED, EventStatus.REJECTED}
-    ),
+    EventStatus.PROCESSED: frozenset({EventStatus.UPLOADING}),
     EventStatus.UPLOADING: frozenset(
         {EventStatus.UPLOADED, EventStatus.FAILED_RETRYABLE, EventStatus.DEAD_LETTERED}
     ),

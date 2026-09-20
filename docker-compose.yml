@@ -1,7 +1,6 @@
 # Local stack. One command brings up everything the gateway needs.
-# Phase 1 ships only Postgres so that `make run` / `make down` work from the
-# start; later phases add the queue, the gateway, the worker and the mock ads
-# API to this file.
+# Later phases add the gateway, worker and mock ads API services here; the
+# `make run` / `make down` targets do not change.
 services:
   postgres:
     image: postgres:16-alpine
@@ -18,6 +17,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Google Cloud Pub/Sub emulator. Speaks the real Pub/Sub API with no
+  # credentials, so the same PubSubPublisher / PubSubConsumer code runs
+  # locally and in production with only PUBSUB_EMULATOR_HOST changing.
+  # It has no persistence: `make queue-init` recreates the topic and
+  # subscription after every restart.
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --project=local-project
+    ports:
+      - "8085:8085"
 
 volumes:
   postgres-data:

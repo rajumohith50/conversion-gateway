@@ -36,12 +36,12 @@ def test_salesforce_valid_payload(
     resp = _post(client, "salesforce", body, SALESFORCE_SECRET)
 
     assert resp.status_code == 202
-    assert resp.json() == {"event_id": "salesforce:e-sf-0001", "status": "VALIDATED"}
+    assert resp.json() == {"event_id": "salesforce:e-sf-0001", "status": "QUEUED"}
 
     with session_factory() as session:
         row = ledger.get_event(session, "salesforce:e-sf-0001")
         assert row is not None
-        assert row.status == "VALIDATED"
+        assert row.status == "QUEUED"
         assert row.source == "salesforce"
         assert row.conversion_action == "closed_won"
         assert row.match_key_type == "click_id"
@@ -50,6 +50,7 @@ def test_salesforce_valid_payload(
         assert [t.to_status for t in ledger.list_transitions(session, row.event_id)] == [
             "RECEIVED",
             "VALIDATED",
+            "QUEUED",
         ]
 
 
@@ -58,12 +59,12 @@ def test_hubspot_valid_payload(client: TestClient, session_factory: sessionmaker
     resp = _post(client, "hubspot", body, HUBSPOT_SECRET)
 
     assert resp.status_code == 202
-    assert resp.json() == {"event_id": "hubspot:987654321", "status": "VALIDATED"}
+    assert resp.json() == {"event_id": "hubspot:987654321", "status": "QUEUED"}
 
     with session_factory() as session:
         row = ledger.get_event(session, "hubspot:987654321")
         assert row is not None
-        assert row.status == "VALIDATED"
+        assert row.status == "QUEUED"
         assert row.source == "hubspot"
         assert row.currency == "USD"
 
@@ -255,7 +256,7 @@ def test_duplicate_delivery_three_times_produces_one_row(
     assert _count_events(session_factory) == 1
     with session_factory() as session:
         # And the audit trail was not appended to by the retries.
-        assert len(ledger.list_transitions(session, expected_id)) == 2
+        assert len(ledger.list_transitions(session, expected_id)) == 3
 
 
 def test_duplicate_with_changed_content_is_still_a_duplicate(

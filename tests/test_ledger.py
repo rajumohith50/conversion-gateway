@@ -19,7 +19,7 @@ def _event():  # type: ignore[no-untyped-def]
     return mappers.parse_and_map(Source.SALESFORCE, salesforce_payload())
 
 
-def test_record_validated_writes_row_and_two_transitions(
+def test_record_validated_writes_row_and_three_transitions(
     session_factory: sessionmaker[Session],
 ) -> None:
     with session_factory.begin() as session:
@@ -29,7 +29,7 @@ def test_record_validated_writes_row_and_two_transitions(
     with session_factory() as session:
         row = ledger.get_event(session, "salesforce:e-sf-0001")
         assert row is not None
-        assert row.status == "VALIDATED"
+        assert row.status == "QUEUED"
         assert row.status_reason is None
         assert row.hashed_identifiers is None  # phase 3 fills this
         assert row.click_id == "Cj0KCQjw-example"
@@ -39,6 +39,7 @@ def test_record_validated_writes_row_and_two_transitions(
         assert [(t.from_status, t.to_status) for t in transitions] == [
             (None, "RECEIVED"),
             ("RECEIVED", "VALIDATED"),
+            ("VALIDATED", "QUEUED"),
         ]
 
 
@@ -65,7 +66,7 @@ def test_duplicate_insert_returns_none_and_leaves_one_row(
     with session_factory.begin() as session:
         assert ledger.record_validated(session, _event(), NOW) is None
     with session_factory() as session:
-        assert len(ledger.list_transitions(session, "salesforce:e-sf-0001")) == 2
+        assert len(ledger.list_transitions(session, "salesforce:e-sf-0001")) == 3
 
 
 def test_record_rejected(session_factory: sessionmaker[Session]) -> None:
@@ -93,10 +94,10 @@ def test_illegal_transition_is_refused(session_factory: sessionmaker[Session]) -
     with session_factory.begin() as session:
         row = ledger.record_validated(session, _event(), NOW)
         assert row is not None
-        with pytest.raises(IllegalTransition, match="VALIDATED -> UPLOADED"):
+        with pytest.raises(IllegalTransition, match="QUEUED -> UPLOADED"):
             ledger.transition(session, row, EventStatus.UPLOADED, None, NOW)
         # Nothing was changed by the refused call.
-        assert row.status == "VALIDATED"
+        assert row.status == "QUEUED"
 
 
 def test_legal_transition_records_reason(session_factory: sessionmaker[Session]) -> None:
@@ -114,6 +115,9 @@ def test_legal_transition_records_reason(session_factory: sessionmaker[Session])
 
 def test_state_machine_covers_every_status_and_terminal_states_have_no_exits() -> None:
     assert set(ALLOWED_TRANSITIONS) == set(EventStatus)
+    # Every non-initial state is reachable from somewhere.
+    reachable = {to for targets in ALLOWED_TRANSITIONS.values() for to in targets}
+    assert reachable == set(EventStatus) - {EventStatus.RECEIVED}
     assert ALLOWED_TRANSITIONS[EventStatus.UPLOADED] == frozenset()
     assert ALLOWED_TRANSITIONS[EventStatus.REJECTED] == frozenset()
     # Replayable terminal states (design sections 6 and 7) can re-enter the queue.

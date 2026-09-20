@@ -24,6 +24,7 @@ from gateway.api.app import create_app
 from gateway.api.signature import compute_signature
 from gateway.config import Settings
 from gateway.db import make_session_factory
+from gateway.queue import MemoryQueue
 
 ADMIN_URL = os.environ.get(
     "TEST_ADMIN_DATABASE_URL", "postgresql+psycopg://gateway:gateway@localhost:5432/gateway"
@@ -86,12 +87,20 @@ def settings() -> Settings:
         webhook_secret_salesforce=SALESFORCE_SECRET,
         webhook_secret_hubspot=HUBSPOT_SECRET,
         webhook_timestamp_tolerance_seconds=300,
+        queue_backend="memory",
     )
 
 
 @pytest.fixture
-def client(settings: Settings, session_factory: sessionmaker[Session]) -> TestClient:
-    return TestClient(create_app(settings, session_factory))
+def queue() -> MemoryQueue:
+    return MemoryQueue()
+
+
+@pytest.fixture
+def client(
+    settings: Settings, session_factory: sessionmaker[Session], queue: MemoryQueue
+) -> TestClient:
+    return TestClient(create_app(settings, session_factory, queue))
 
 
 def signed_headers(secret: str, body: bytes, timestamp: int | None = None) -> dict[str, str]:

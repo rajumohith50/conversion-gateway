@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from gateway.api.app import create_app
 from gateway.config import Settings
 from gateway.db import make_session_factory
+from gateway.queue import MemoryQueue
 from tests.api.payloads import salesforce_payload
 from tests.conftest import SALESFORCE_SECRET, signed_headers
 
@@ -24,7 +25,7 @@ def test_get_event_returns_lifecycle_and_transitions(client: TestClient) -> None
     data = resp.json()
     assert data["event_id"] == "salesforce:e-sf-0001"
     assert data["source"] == "salesforce"
-    assert data["status"] == "VALIDATED"
+    assert data["status"] == "QUEUED"
     assert data["status_reason"] is None
     assert data["conversion_action"] == "closed_won"
     assert data["match_key_type"] == "click_id"
@@ -32,6 +33,7 @@ def test_get_event_returns_lifecycle_and_transitions(client: TestClient) -> None
     assert [(t["from_status"], t["to_status"]) for t in data["transitions"]] == [
         (None, "RECEIVED"),
         ("RECEIVED", "VALIDATED"),
+        ("VALIDATED", "QUEUED"),
     ]
     # The response exposes lifecycle, never identifiers.
     assert "Gmail" not in resp.text
@@ -69,7 +71,7 @@ def test_readyz_503_when_database_unreachable(settings: Settings) -> None:
     # Port 1 refuses immediately; no waiting on a timeout.
     dead_engine = create_engine("postgresql+psycopg://x:x@127.0.0.1:1/x")
     dead_factory: sessionmaker[Session] = make_session_factory(dead_engine)
-    app = create_app(settings, dead_factory)
+    app = create_app(settings, dead_factory, MemoryQueue())
     resp = TestClient(app).get("/readyz")
     assert resp.status_code == 503
     assert resp.json() == {"status": "unavailable", "database": "unreachable"}
