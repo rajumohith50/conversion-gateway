@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck fmt run down
+.PHONY: install test lint typecheck fmt run down migrate api
 
 install:
 	uv sync
@@ -24,3 +24,11 @@ run:
 
 down:
 	docker compose down --volumes
+
+# Apply ledger migrations to DATABASE_URL (from .env or the environment).
+migrate:
+	uv run alembic upgrade head
+
+# Serve the ingest API locally against the compose Postgres.
+api:
+	uv run uvicorn gateway.api.app:create_app_from_env --factory --host 0.0.0.0 --port 8080 --reload
