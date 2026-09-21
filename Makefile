@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck fmt run down migrate api worker queue-init reconcile
+.PHONY: install test lint typecheck fmt run down migrate api worker uploader queue-init reconcile mock-api
 
 install:
 	uv sync
@@ -45,3 +45,10 @@ worker:
 
 reconcile:
 	uv run gateway reconcile
+
+uploader:
+	uv run gateway uploader
+
+# The mock ad platform, on the port .env.example points ADS_API_BASE_URL at.
+mock-api:
+	uv run uvicorn mock_ads_api.app:create_app_from_env --factory --host 0.0.0.0 --port 8081

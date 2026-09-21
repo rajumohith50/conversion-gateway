@@ -46,8 +46,8 @@ flowchart LR
     classDef planned fill:#5b5f66,stroke:#2f3236,color:#ffffff,stroke-dasharray:4 3
     classDef external fill:#2b4c7e,stroke:#16283f,color:#ffffff
 
-    class API,LEDGER,Q,W,NORM,CONSENT built
-    class UP,DLQ,REPLAY planned
+    class API,LEDGER,Q,W,NORM,CONSENT,UP built
+    class DLQ,REPLAY planned
     class CRM,ADS external
 ```
 
@@ -130,6 +130,63 @@ durable but stuck in `QUEUED`; `gateway reconcile` finds those, re-enqueues
 the ones that can be recovered from the ledger alone (click-ID events), and
 names the ones that need a CRM resend.
 
+## What the uploader does
+
+The upload stage is driven from the ledger, not the queue. A `PROCESSED`
+row holds everything the platform needs, so the uploader claims rows with
+`SELECT … FOR UPDATE SKIP LOCKED`, batches them, and writes each row's
+outcome back. A crash anywhere leaves rows in `UPLOADING`; they are
+re-claimed as stale. Two uploaders can run side by side without stepping
+on each other.
+
+```mermaid
+flowchart TD
+    CLAIM["claim(): PROCESSED, due FAILED_RETRYABLE,<br/>stale UPLOADING → UPLOADING, attempt_count += 1"]
+    BATCH["Batcher: N rows or T seconds"]
+    SEND["client.upload(batch)<br/>tenacity: exponential backoff, full jitter,<br/>capped attempts and elapsed time"]
+    CLS{"classify"}
+    OK["per-row results, by index"]
+    ROWOK["UPLOADED"]
+    ROWRETRY["FAILED_RETRYABLE<br/>re-claimed after retry_after,<br/>up to the attempt ceiling"]
+    ROWDEAD["DEAD_LETTERED<br/>permanent_row:&lt;code&gt;"]
+    PERM["DEAD_LETTERED (whole batch)<br/>permanent:http_401"]
+    POISON["DEAD_LETTERED (whole batch)<br/>poison:http_503:after_6_attempts"]
+
+    CLAIM --> BATCH --> SEND --> CLS
+    CLS -->|"429 / 5xx / timeout / malformed"| RETRY["FAILED_RETRYABLE → UPLOADING<br/>recorded per attempt"] --> SEND
+    CLS -->|"4xx"| PERM
+    CLS -->|"retries exhausted"| POISON
+    CLS -->|"200"| OK
+    OK -->|"ok"| ROWOK
+    OK -->|"TOO_RECENT_CONVERSION"| ROWRETRY
+    OK -->|"any other row error"| ROWDEAD
+
+    classDef good fill:#1f6f43,stroke:#0e3d24,color:#ffffff
+    classDef terminal fill:#5b5f66,stroke:#2f3236,color:#ffffff
+    class ROWOK good
+    class ROWDEAD,PERM,POISON terminal
+```
+
+**Partial failures are handled per row and the batch is never re-sent.**
+The response's `results[]` has one entry per input row; each error carries
+`location.fieldPathElements[].index`. Rows that succeeded are `UPLOADED`
+and are not eligible for another claim, so a later cycle sends only the
+rows that need it. The
+[test](tests/upload/test_uploader.py) asserts the exact sequence of order
+ids in every request the client made.
+
+A whole-request transient failure (429, 5xx, timeout) is retried with the
+full batch, which is safe because nothing was accepted. A malformed
+response is the one ambiguous case: the platform might have accepted the
+batch. It is treated as transient, and every row carries `orderId =
+event_id` so the platform dedupes a re-send.
+
+`mock_ads_api/` is a small FastAPI service that speaks the platform's
+request and response shapes and fails on command (`POST /control`: 429,
+500, 503, 401, timeout, malformed body, specific row indexes). It rejects
+any hashed identifier that is not 64 lowercase hex characters, so it
+catches the gateway's own hashing bugs before a real account would.
+
 ## Event lifecycle
 
 Every transition is written to an append-only table with a timestamp and a
@@ -175,6 +232,9 @@ These are the decisions the codebase exists to demonstrate.
 | **PII in logs and errors.** Pydantic's validation errors include the offending input. | Error payloads carry only field path and error type. Rejection exceptions hold the field name, never the value. |
 | **Double-processing on redelivery.** At-least-once queues redeliver; a naive worker hashes and transitions twice. | The worker reads the ledger row first and skips anything not `QUEUED`. Commit-then-ack ordering means a crash never loses work, only repeats a no-op. |
 | **Lost messages with no trace.** Ledger commit and queue publish cannot share a transaction. | Commit first, publish second. A failed publish leaves a durable `QUEUED` row that `gateway reconcile` finds and, where the match key is on the row, re-enqueues. |
+| **Retrying the whole batch on a partial failure.** The rows that succeeded get uploaded again. | Per-row results are mapped back by index; successes are `UPLOADED` and never re-claimed. A test asserts the exact order ids in every request. |
+| **Retrying permanent errors.** A 401 or a bad conversion action retried six times burns quota and delays valid traffic queued behind it. | Classification happens at the HTTP edge, before the retry decision. Only transient classes reach tenacity. |
+| **Silent hashing bugs at the platform boundary.** Wrong casing or length in a digest is accepted by a lenient mock and matches nothing in production. | The mock rejects any hashed identifier that is not 64 lowercase hex characters. |
 
 ## Status
 
@@ -183,7 +243,7 @@ Built in phases, each committed separately.
 - [x] **Phase 1** — project skeleton, normalisation + hashing, consent gate
 - [x] **Phase 2** — ingest API and event ledger (HMAC verification, per-source schemas, idempotency, Alembic)
 - [x] **Phase 3** — queue abstraction (in-memory + Pub/Sub emulator), processing worker, reconciliation CLI
-- [ ] **Phase 4** — upload client with error classification, backoff, partial-batch handling; mock ads API
+- [x] **Phase 4** — upload client with error classification, backoff, partial-batch handling; mock ads API
 - [ ] **Phase 5** — dead-letter store and replay CLI
 - [ ] **Phase 6** — structured logging with PII redaction, Prometheus metrics, container, runbook
 
@@ -195,7 +255,9 @@ make run         # docker compose up (Postgres + Pub/Sub emulator)
 make migrate     # alembic upgrade head
 make queue-init  # create the Pub/Sub topic + subscription on the emulator
 make api         # uvicorn on :8080
+make mock-api    # mock ad platform on :8081
 make worker      # gateway worker: consume, gate, hash, persist
+make uploader    # gateway uploader: claim, batch, upload, record outcomes
 make reconcile   # gateway reconcile: list events stuck in QUEUED
 make test        # pytest with coverage (floor: 90%); needs `make run`
 make lint      # ruff check + format check
@@ -228,6 +290,7 @@ transition. `GET /healthz` is liveness; `GET /readyz` checks the database.
 
 ```
 gateway worker                          # run the processor until SIGINT/SIGTERM
+gateway uploader                        # run the upload loop until SIGINT/SIGTERM
 gateway reconcile [--older-than 300]    # list QUEUED events with no progress; exit 1 if any
 gateway reconcile --republish           # also re-enqueue the click-ID ones
 gateway queue-init                      # create topic + subscription
@@ -241,7 +304,7 @@ session. That is deliberate: the idempotency guarantee rests on Postgres'
 `ON CONFLICT` semantics, and the migration is code worth exercising.
 
 ```
-246 passed · 99% line and branch coverage · mypy --strict clean
+336 passed · 98% line and branch coverage · mypy --strict clean
 ```
 
 ## Layout
@@ -256,11 +319,12 @@ src/gateway/
 ├── queue/          QueuePublisher / QueueConsumer; in-memory and Pub/Sub implementations
 ├── processor.py    What happens to one queued event: consent, normalise, persist
 ├── worker.py       The receive / process / ack loop
-├── cli.py          gateway worker | reconcile | queue-init
+├── upload/         UploadClient interface + HTTP impl, batcher, classifier, retry policy, uploader loop
+├── cli.py          gateway worker | uploader | reconcile | queue-init
 ├── wiring.py       Builds the queue objects Settings asks for
-├── upload/         (phase 4)
 ├── dlq/            (phase 5)
 └── observability/  (phase 6)
+mock_ads_api/       Configurable mock of the platform's upload endpoint
 migrations/         Alembic
 tests/              Fixture tables, state machine, HTTP integration against Postgres
 docs/DESIGN.md      Technical design
@@ -269,5 +333,5 @@ docs/DESIGN.md      Technical design
 ## Stack
 
 Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · Alembic · Postgres ·
-Google Cloud Pub/Sub · phonenumbers · pytest · ruff · mypy --strict · uv ·
-Docker Compose
+Google Cloud Pub/Sub · httpx · tenacity · phonenumbers · pytest · ruff ·
+mypy --strict · uv · Docker Compose

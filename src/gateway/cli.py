@@ -1,6 +1,7 @@
 """Operator commands. `gateway <command>` after `uv sync`.
 
     worker       run the processing loop until SIGINT/SIGTERM
+    uploader     run the upload loop until SIGINT/SIGTERM
     reconcile    list events stuck in QUEUED; optionally re-enqueue the
                  ones that can be
     queue-init   create the Pub/Sub topic and subscription
@@ -25,24 +26,63 @@ from gateway.db import make_engine, make_session_factory
 from gateway.models.status import MatchKeyType
 from gateway.normalise import RawIdentifiers
 from gateway.queue import QueueConsumer, QueueMessage, QueuePublisher
+from gateway.upload import uploader as upload_loop
+from gateway.upload.backoff import RetryPolicy
+from gateway.upload.client import HttpUploadClient
+from gateway.upload.uploader import Uploader
 from gateway.wiring import make_consumer, make_publisher
+
+
+def _stop_on_signal() -> threading.Event:
+    stop = threading.Event()
+    # Either signal sets the flag; the loop notices within one poll and
+    # exits after finishing the batch it is on. Nothing is lost: unacked
+    # messages redeliver, and claimed rows are re-picked as stale.
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    return stop
 
 
 def run_worker(
     consumer: QueueConsumer, session_factory: sessionmaker[Session], settings: Settings
 ) -> None:
-    stop = threading.Event()
-    # Either signal sets the flag; the loop notices within one poll timeout
-    # and exits after finishing the message it is on. No message is lost:
-    # unacked messages redeliver.
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     worker.run(
         consumer,
         session_factory,
-        stop,
+        _stop_on_signal(),
         batch_size=settings.worker_batch_size,
         poll_timeout_seconds=settings.worker_poll_timeout_seconds,
+    )
+
+
+def build_uploader(session_factory: sessionmaker[Session], settings: Settings) -> Uploader:
+    client = HttpUploadClient(
+        settings.ads_api_base_url, settings.ads_api_token, settings.ads_api_timeout_seconds
+    )
+    policy = RetryPolicy(
+        max_attempts=settings.upload_max_attempts,
+        max_elapsed_seconds=settings.upload_max_elapsed_seconds,
+        backoff_base_seconds=settings.upload_backoff_base_seconds,
+        backoff_max_seconds=settings.upload_backoff_max_seconds,
+    )
+    return Uploader(
+        session_factory,
+        client,
+        policy,
+        customer_id=settings.ads_customer_id,
+        batch_size=settings.upload_batch_size,
+        batch_wait_seconds=settings.upload_batch_wait_seconds,
+        row_retry_after=timedelta(seconds=settings.upload_row_retry_after_seconds),
+        stale_after=timedelta(seconds=settings.upload_stale_after_seconds),
+        max_row_attempts=settings.upload_max_attempts,
+    )
+
+
+def run_uploader(session_factory: sessionmaker[Session], settings: Settings) -> None:
+    upload_loop.run(
+        build_uploader(session_factory, settings),
+        _stop_on_signal(),
+        settings.upload_poll_interval_seconds,
     )
 
 
@@ -114,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gateway")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("worker", help="consume the queue and process events")
+    sub.add_parser("uploader", help="upload PROCESSED events to the ad platform")
     rec = sub.add_parser("reconcile", help="find events stuck in QUEUED")
     rec.add_argument("--older-than", type=int, default=None, metavar="SECONDS")
     rec.add_argument("--republish", action="store_true")
@@ -135,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     session_factory = make_session_factory(make_engine(settings.database_url))
     if args.command == "worker":
         run_worker(make_consumer(settings), session_factory, settings)
+        return 0
+    if args.command == "uploader":
+        run_uploader(session_factory, settings)
         return 0
 
     older_than = args.older_than or settings.reconcile_stuck_after_seconds

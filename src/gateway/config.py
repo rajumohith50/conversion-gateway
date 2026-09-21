@@ -45,3 +45,26 @@ class Settings(BaseSettings):
 
     # reconcile: a QUEUED event older than this with no progress is stuck.
     reconcile_stuck_after_seconds: int = Field(default=300, ge=1)
+
+    # Upload client. Base URL points at the mock locally.
+    ads_api_base_url: str = "http://localhost:8081"
+    ads_api_token: str = ""
+    ads_api_timeout_seconds: float = Field(default=10.0, gt=0)
+    # Conversion actions are addressed as customers/<id>/conversionActions/<name>.
+    ads_customer_id: str = "1234567890"
+
+    # Batching: send when this many rows are waiting, or when the oldest
+    # has waited this long.
+    upload_batch_size: int = Field(default=100, ge=1)
+    upload_batch_wait_seconds: float = Field(default=5.0, ge=0)
+
+    # Retry policy for transient failures (design section 7).
+    upload_max_attempts: int = Field(default=6, ge=1)
+    upload_max_elapsed_seconds: float = Field(default=600.0, gt=0)
+    upload_backoff_base_seconds: float = Field(default=1.0, gt=0)
+    upload_backoff_max_seconds: float = Field(default=60.0, gt=0)
+    # Row-level retryable errors are re-claimed after this long; a row
+    # stuck in UPLOADING longer than stale_after is assumed orphaned.
+    upload_row_retry_after_seconds: int = Field(default=60, ge=0)
+    upload_stale_after_seconds: int = Field(default=600, ge=1)
+    upload_poll_interval_seconds: float = Field(default=1.0, gt=0)

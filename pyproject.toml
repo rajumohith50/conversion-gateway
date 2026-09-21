@@ -42,7 +42,7 @@ packages = ["src/gateway"]
 [tool.pytest.ini_options]
 # Tests import `gateway` directly; pointing pytest at src/ avoids needing an
 # editable install just to run the suite.
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 # Coverage on every run, failing under the floor. The floor is high because
@@ -73,7 +73,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src"]
+files = ["src", "mock_ads_api"]
 
 [[tool.mypy.overrides]]
 # google-cloud-pubsub ships no py.typed marker. Everything that touches it

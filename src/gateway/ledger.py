@@ -6,10 +6,10 @@ the transaction boundary, which is what lets phase 3 put "write the row" and
 than calling datetime.now() so tests can pin timestamps.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from gateway.db import Session
@@ -185,6 +185,67 @@ def find_stuck_queued(session: Session, older_than: datetime) -> list[Event]:
         .order_by(Event.received_at)
     )
     return list(session.scalars(stmt))
+
+
+def claim_for_upload(
+    session: Session, now: datetime, limit: int, retry_after: timedelta, stale_after: timedelta
+) -> list[Event]:
+    """Pick rows ready to upload and mark them UPLOADING in one transaction.
+
+    Eligible:
+      PROCESSED          hashed and never attempted
+      FAILED_RETRYABLE   a row-level retryable error, once retry_after has
+                         passed since the last attempt
+      UPLOADING          stale: claimed longer than stale_after ago by an
+                         uploader that must have died mid-batch
+
+    FOR UPDATE SKIP LOCKED means two uploaders can run against the same
+    ledger and never claim the same row: each skips rows the other has
+    locked instead of blocking on them.
+    """
+    stmt = (
+        select(Event)
+        .where(
+            or_(
+                Event.status == EventStatus.PROCESSED.value,
+                (Event.status == EventStatus.FAILED_RETRYABLE.value)
+                & (Event.last_attempt_at <= now - retry_after),
+                (Event.status == EventStatus.UPLOADING.value)
+                & (Event.last_attempt_at <= now - stale_after),
+            )
+        )
+        .order_by(Event.received_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    claimed = list(session.scalars(stmt))
+    for event in claimed:
+        if event.status != EventStatus.UPLOADING.value:
+            transition(session, event, EventStatus.UPLOADING, None, now)
+        else:
+            # Re-claiming a stale UPLOADING row is not a state change, but
+            # it is worth an audit line saying why the attempt count moved.
+            session.add(
+                EventTransition(
+                    event_id=event.event_id,
+                    from_status=event.status,
+                    to_status=event.status,
+                    reason="reclaimed_stale",
+                    occurred_at=now,
+                )
+            )
+        event.attempt_count += 1
+        event.last_attempt_at = now
+    return claimed
+
+
+def record_retry_attempt(session: Session, event: Event, reason: str, now: datetime) -> None:
+    """Between two attempts of the same batch: UPLOADING -> FAILED_RETRYABLE
+    -> UPLOADING, so the ledger shows every attempt and why it failed."""
+    transition(session, event, EventStatus.FAILED_RETRYABLE, reason, now)
+    transition(session, event, EventStatus.UPLOADING, None, now)
+    event.attempt_count += 1
+    event.last_attempt_at = now
 
 
 def list_transitions(session: Session, event_id: str) -> list[EventTransition]:
