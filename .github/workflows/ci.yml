@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check src tests mock_ads_api
+          uv run ruff format --check src tests mock_ads_api
+
+      - name: Typecheck
+        run: uv run mypy
+
+      # Service containers cannot override the image's command, and the
+      # emulator image needs one, so it is started by hand.
+      - name: Start Pub/Sub emulator
+        run: |
+          docker run -d --name pubsub -p 8085:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --project=local-project
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:8085/ > /dev/null && break
+            sleep 2
+          done
+
+      - name: Test
+        env:
+          PUBSUB_EMULATOR_HOST: localhost:8085
+        run: uv run pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t conversion-gateway:ci .
+      - name: Image runs as non-root and imports both packages
+        run: |
+          docker run --rm conversion-gateway:ci sh -c '
+            test "$(id -u)" = "1001" &&
+            python -c "import gateway.api.app, mock_ads_api.app" &&
+            gateway --help > /dev/null'

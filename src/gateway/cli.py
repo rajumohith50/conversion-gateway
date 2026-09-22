@@ -308,6 +308,25 @@ def reconcile_cmd(
     raise typer.Exit(code=1 if found else 0)
 
 
+@app.command("seed")
+def seed_cmd(
+    api_url: Annotated[str, typer.Option(envvar="SEED_API_URL")] = "http://localhost:8080",
+    wait: Annotated[float, typer.Option(help="Seconds to wait for terminal states")] = 60.0,
+) -> None:
+    """Post a demo mix of webhooks and report where each one ended up."""
+    from gateway.seed import seed
+
+    settings = Settings()
+    ok = seed(
+        api_url,
+        settings.webhook_secret_salesforce,
+        settings.webhook_secret_hubspot,
+        sys.stdout,
+        wait_seconds=wait,
+    )
+    raise typer.Exit(code=0 if ok else 1)
+
+
 @app.command("queue-init")
 def queue_init_cmd() -> None:
     """Create the Pub/Sub topic and subscription."""

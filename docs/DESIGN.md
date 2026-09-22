@@ -296,3 +296,20 @@ idempotency key the receiver deduplicates on.
 ├── Makefile
 └── .env.example
 ```
+
+---
+
+## Appendix: where the implementation departs from this document
+
+Written after the build. Each item is a deliberate change, with the reason.
+
+| Design says | Implementation does | Why |
+| --- | --- | --- |
+| Lifecycle: `RECEIVED → VALIDATED → {SUPPRESSED \| QUEUED} → UPLOADING → …` | Adds two states: `REJECTED` (terminal, for events that authenticated but failed schema validation or normalisation) and `PROCESSED` (digests persisted, awaiting upload). Consent is evaluated in the worker, so `SUPPRESSED` follows `QUEUED`, not `VALIDATED`. | Section 4 says rejected events must be queryable, which needs a row and a state. `PROCESSED` marks the point after which the ledger row is self-sufficient (digests on the row, raw PII gone), which is what lets the upload stage be driven from the ledger and recover from a crash anywhere. |
+| Processor → Batcher → Upload client as one flow from the queue | The uploader is a separate process that claims `PROCESSED` rows from the ledger with `SELECT … FOR UPDATE SKIP LOCKED`. | No second queue hop, horizontal scaling for free, and an uploader that dies mid-batch leaves rows in `UPLOADING` that are re-claimed as stale. The queue carries raw identifiers and nothing downstream of hashing needs them. |
+| Ledger record fields (section 4 table) | Adds `click_id` (not PII; the click-ID path cannot upload without it) and `correlation_id` (so the worker and uploader can join their log lines to the API's). | |
+| "The ingest API holds the raw payload only for the duration of the request" | True. Consequence made explicit: the queue message is the only place raw identifiers exist between ingest and hashing. If the publish fails after the ledger commit, identifier-matched events cannot be reconstructed; `gateway reconcile` re-enqueues click-ID events and lists the rest as needing a CRM resend. | The alternative — hashing at ingest — would make every row recoverable but moves normalisation out of the processor. Kept as designed; the trade-off is documented rather than hidden. |
+| Metrics "all labelled by source and conversion action" | `upload_latency_seconds` is labelled by `outcome` instead. | One request carries rows from several sources; per-row latency does not exist. |
+| Poison: "Repeated transient failures past the attempt ceiling → dead-letter" | As designed, and applied to the whole batch. The batch was never accepted, so nothing double-uploads; the replay CLI is the recovery once the platform is back. | A long platform outage therefore dead-letters everything in flight rather than parking it. Chosen for simplicity; see "what to improve first" in the README's final summary. |
+| Replay: `DLQ → Replay CLI → Queue` | As designed. The replayed message carries no identifiers; the processor re-runs the consent gate and reuses the digests already on the row instead of re-normalising nothing. | |
+| Section 12 layout | Adds `processor.py`, `worker.py`, `cli.py`, `seed.py`, `wiring.py` at the package root and a `dead_letters` table alongside `events`. | |

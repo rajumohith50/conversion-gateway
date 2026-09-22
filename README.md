@@ -1,253 +1,198 @@
 # First-Party Conversion Gateway
 
-A server-side gateway that closes the loop between a CRM and an ad platform.
-A lead form fires, a sales rep marks the lead closed-won days later, and the
-ad platform never hears about it. This service receives that CRM outcome,
-normalises and hashes the identifiers, gates on consent, and uploads an
-offline conversion the platform can match back to the original ad click.
+[![ci](https://github.com/rajumohith50/conversion-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/rajumohith50/conversion-gateway/actions/workflows/ci.yml)
 
-It is a reference implementation: the design choices are the point, and each
-one is commented in the code with why that way. The full technical design is
-in [docs/DESIGN.md](docs/DESIGN.md).
+An advertiser runs lead-generation campaigns, a user submits a form, and days
+later a sales rep marks that lead closed-won in the CRM — but the ad platform
+never hears about it, so it keeps optimising for form fills instead of
+revenue. Closing the loop means sending the closed-won outcome back to the
+platform, matched to the original click, without leaking personal data,
+without uploading for users who did not consent, and without double-counting
+when the CRM retries. This service does that: it receives CRM webhooks,
+normalises and hashes the identifiers, gates on consent, and uploads offline
+conversions with a durable, queryable record of where every event ended up.
 
-## Pipeline
+> **Honesty note.** This is a reference implementation. It uploads to a
+> [mock of the ad platform's API](mock_ads_api/) that speaks the real request
+> and response shapes and fails on command — there is no advertiser account
+> behind it. The upload client is an [interface](src/gateway/upload/client.py)
+> with one HTTP implementation; pointing it at the real service is a base URL,
+> a path, and an auth header, not a redesign. Everything upstream of that
+> boundary — signature verification, the ledger, consent, normalisation,
+> hashing, the queue, retries, partial-failure handling, dead-lettering,
+> replay, metrics, redaction — is real and tested against real Postgres and a
+> real Pub/Sub emulator.
+
+The full technical design is in [docs/DESIGN.md](docs/DESIGN.md). A client
+engineer integrating with this should read
+[docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md); whoever is on call
+should read [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    CRM["CRM webhook<br/>(Salesforce / HubSpot)"]
-    API["Ingest API<br/>verify HMAC · validate · dedupe"]
-    LEDGER[("Event ledger<br/>Postgres")]
-    Q[["Event queue"]]
-    W["Processor"]
-    CONSENT{"Consent<br/>granted?"}
-    NORM["Normalise + hash<br/>SHA-256, never raw PII"]
-    UP["Upload client<br/>batch · classify · retry"]
-    ADS["Ad platform<br/>offline conversions"]
-    DLQ[("Dead-letter<br/>store")]
-    REPLAY["Replay CLI"]
-
-    CRM -->|"POST /webhooks/crm/{source}"| API
-    API -->|"202 + event id"| CRM
-    API --> LEDGER
-    API --> Q
-    Q --> W
-    W --> CONSENT
-    CONSENT -->|"no → SUPPRESSED"| LEDGER
-    CONSENT -->|yes| NORM
-    NORM --> LEDGER
-    NORM --> UP
-    UP -->|success| ADS
-    UP -->|"transient → backoff"| UP
-    UP -->|"permanent"| DLQ
-    DLQ --> REPLAY
+    CRM[CRM webhook] --> API[Ingest API]
+    API -->|202 + event id| CRM
+    API --> LEDGER[(Event ledger)]
+    API --> Q[[Event queue]]
+    Q --> W[Processor]
+    W --> CONSENT{Consent<br/>permitted?}
+    CONSENT -->|no| SUP[(Suppressed)]
+    CONSENT -->|yes| NORM[Normalise + hash]
+    NORM --> BATCH[Batcher]
+    BATCH --> UP[Upload client]
+    UP -->|success| LEDGER
+    UP -->|retryable| BATCH
+    UP -->|permanent| DLQ[(Dead letter)]
+    DLQ --> REPLAY[Replay CLI]
     REPLAY --> Q
-
-    classDef built fill:#1f6f43,stroke:#0e3d24,color:#ffffff
-    classDef planned fill:#5b5f66,stroke:#2f3236,color:#ffffff,stroke-dasharray:4 3
-    classDef external fill:#2b4c7e,stroke:#16283f,color:#ffffff
-
-    class API,LEDGER,Q,W,NORM,CONSENT,UP,DLQ,REPLAY built
-    class CRM,ADS external
 ```
 
-**Green** is built and tested. **Blue** is outside the system boundary.
+Three processes share one Postgres ledger and one Pub/Sub topic:
 
-## What happens on a webhook
+| Process | Does | Never does |
+| --- | --- | --- |
+| **api** | Verifies the HMAC signature, validates the payload, writes the ledger row, publishes to the queue, answers in ~30 ms. | Hash, upload, or keep raw identifiers past the request. |
+| **worker** | Consumes the queue, gates on consent, normalises and hashes, writes digests to the row. | See a raw identifier after this point. |
+| **uploader** | Claims hashed rows from the ledger, batches, uploads with retry, records per-row outcomes, dead-letters permanent failures. | Re-send a row that already succeeded. |
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant CRM
-    participant API as Ingest API
-    participant SIG as Signature check
-    participant MAP as Schema + mapper
-    participant DB as Ledger (Postgres)
+Every state change is written to an append-only transitions table with a
+timestamp and a reason code. "Where did event X end up and why" is one query,
+and `GET /events/{id}` returns it.
 
-    CRM->>API: POST /webhooks/crm/salesforce<br/>X-Webhook-Timestamp, X-Webhook-Signature
-    API->>SIG: HMAC-SHA256("timestamp.body"), constant-time compare, ±300s window
-    alt signature or timestamp invalid
-        SIG-->>CRM: 401 — nothing written
-    else authentic
-        API->>MAP: parse JSON → per-source schema → CanonicalLeadEvent
-        alt schema invalid
-            MAP->>DB: INSERT … ON CONFLICT DO NOTHING<br/>status = REJECTED, reason = "missing:Lead.Id"
-            DB-->>CRM: 422 with structured reasons, no input values
-        else valid
-            MAP->>DB: INSERT … ON CONFLICT DO NOTHING RETURNING<br/>RECEIVED → VALIDATED, two transition rows
-            alt row inserted
-                DB-->>CRM: 202 {event_id, status}
-            else event_id already present
-                DB-->>CRM: 200 {original event_id, status} — duplicate, no second row
-            end
-        end
-    end
-```
+## Quickstart
 
-After the commit the API publishes `{event_id, raw identifiers}` to the
-queue. The raw identifiers exist only on that message and only until the
-worker hashes them; the ledger row holds digests, consent state, and
-lifecycle. A test dumps every column and asserts the raw email, phone and
-name are absent.
-
-## What the worker does
-
-```mermaid
-flowchart TD
-    Q[["Queue"]] -->|"receive()"| LOAD["Load ledger row by event_id"]
-    LOAD -->|"no row"| ORPHAN["ack: orphan message"]
-    LOAD -->|"status ≠ QUEUED"| DUP["ack: already handled<br/>(at-least-once redelivery)"]
-    LOAD -->|"QUEUED"| CONSENT{"both consent<br/>signals GRANTED?"}
-    CONSENT -->|no| SUP["SUPPRESSED<br/>reason = which signal, and whether<br/>denied / unspecified / absent"]
-    CONSENT -->|yes| NORM["build_user_identifiers()<br/>normalise + SHA-256 every field"]
-    NORM -->|"any field rejected"| REJ["REJECTED<br/>reason = 'unparseable:phone;…'"]
-    NORM -->|ok| PROC["PROCESSED<br/>digests written to ledger"]
-    SUP --> ACK["commit, then ack"]
-    REJ --> ACK
-    PROC --> ACK
-    ACK -.->|"exception anywhere"| NACK["rollback, nack → redeliver"]
-
-    classDef terminal fill:#5b5f66,stroke:#2f3236,color:#ffffff
-    classDef good fill:#1f6f43,stroke:#0e3d24,color:#ffffff
-    class SUP,REJ terminal
-    class PROC good
-```
-
-Consent is evaluated before the identifiers are touched, so a denied user's
-PII is never even normalised. Commit happens before ack, which is what makes
-delivery at-least-once: a crash between the two redelivers a message whose
-row is already `PROCESSED`, and the worker skips it.
-
-The transport is an interface ([`QueuePublisher` / `QueueConsumer`](src/gateway/queue/base.py))
-with two implementations: in-memory for tests, Google Cloud Pub/Sub (against
-the emulator locally) for anything with two processes. `QUEUE_BACKEND` picks
-one; nothing else changes.
-
-There is no transaction spanning Postgres and the queue, so the ledger
-commit goes first and the publish second. If the publish fails the event is
-durable but stuck in `QUEUED`; `gateway reconcile` finds those, re-enqueues
-the ones that can be recovered from the ledger alone (click-ID events), and
-names the ones that need a CRM resend.
-
-## What the uploader does
-
-The upload stage is driven from the ledger, not the queue. A `PROCESSED`
-row holds everything the platform needs, so the uploader claims rows with
-`SELECT … FOR UPDATE SKIP LOCKED`, batches them, and writes each row's
-outcome back. A crash anywhere leaves rows in `UPLOADING`; they are
-re-claimed as stale. Two uploaders can run side by side without stepping
-on each other.
-
-```mermaid
-flowchart TD
-    CLAIM["claim(): PROCESSED, due FAILED_RETRYABLE,<br/>stale UPLOADING → UPLOADING, attempt_count += 1"]
-    BATCH["Batcher: N rows or T seconds"]
-    SEND["client.upload(batch)<br/>tenacity: exponential backoff, full jitter,<br/>capped attempts and elapsed time"]
-    CLS{"classify"}
-    OK["per-row results, by index"]
-    ROWOK["UPLOADED"]
-    ROWRETRY["FAILED_RETRYABLE<br/>re-claimed after retry_after,<br/>up to the attempt ceiling"]
-    ROWDEAD["DEAD_LETTERED<br/>permanent_row:&lt;code&gt;"]
-    PERM["DEAD_LETTERED (whole batch)<br/>permanent:http_401"]
-    POISON["DEAD_LETTERED (whole batch)<br/>poison:http_503:after_6_attempts"]
-
-    CLAIM --> BATCH --> SEND --> CLS
-    CLS -->|"429 / 5xx / timeout / malformed"| RETRY["FAILED_RETRYABLE → UPLOADING<br/>recorded per attempt"] --> SEND
-    CLS -->|"4xx"| PERM
-    CLS -->|"retries exhausted"| POISON
-    CLS -->|"200"| OK
-    OK -->|"ok"| ROWOK
-    OK -->|"TOO_RECENT_CONVERSION"| ROWRETRY
-    OK -->|"any other row error"| ROWDEAD
-
-    classDef good fill:#1f6f43,stroke:#0e3d24,color:#ffffff
-    classDef terminal fill:#5b5f66,stroke:#2f3236,color:#ffffff
-    class ROWOK good
-    class ROWDEAD,PERM,POISON terminal
-```
-
-**Partial failures are handled per row and the batch is never re-sent.**
-The response's `results[]` has one entry per input row; each error carries
-`location.fieldPathElements[].index`. Rows that succeeded are `UPLOADED`
-and are not eligible for another claim, so a later cycle sends only the
-rows that need it. The
-[test](tests/upload/test_uploader.py) asserts the exact sequence of order
-ids in every request the client made.
-
-A whole-request transient failure (429, 5xx, timeout) is retried with the
-full batch, which is safe because nothing was accepted. A malformed
-response is the one ambiguous case: the platform might have accepted the
-batch. It is treated as transient, and every row carries `orderId =
-event_id` so the platform dedupes a re-send.
-
-`mock_ads_api/` is a small FastAPI service that speaks the platform's
-request and response shapes and fails on command (`POST /control`: 429,
-500, 503, 401, timeout, malformed body, specific row indexes). It rejects
-any hashed identifier that is not 64 lowercase hex characters, so it
-catches the gateway's own hashing bugs before a real account would.
-
-## Dead letters and replay
-
-Every dead-lettering writes a `dead_letters` row alongside the ledger
-transition: the exact conversion payload that was sent (digests only), the
-failure class (`partial` / `permanent` / `poison`), the platform's error
-code and message, and the full attempt history. The row survives replay,
-so the record of what failed is not lost when it is fixed.
+Requires Docker with Compose v2. Nothing else.
 
 ```
-$ gateway dlq list --reason permanent_row:
-    id  dead_lettered_at          source      class     event_id                    reason
-     1  2026-09-22T01:17:33+00:00 salesforce  partial   salesforce:dlq-1790039848   permanent_row:CONVERSION_ACTION_NOT_FOUND
-
-$ gateway dlq show 1            # full record as JSON
-$ gateway dlq replay --id 1     # or --reason / --source / --failure-class / --since / --until
-replayed 1 salesforce:dlq-1790039848
+git clone https://github.com/rajumohith50/conversion-gateway
+cd conversion-gateway
+make up      # builds the image; starts postgres, pub/sub emulator, mock ads api,
+             # runs migrations and queue setup, then api + worker + uploader
+make seed    # posts seven webhooks and reports where each one ended up
 ```
 
-Replay moves the event `DEAD_LETTERED → QUEUED` with a fresh attempt
-budget and republishes it. The queue message carries no identifiers — the
-raw ones were never kept — so the worker re-runs the consent gate and
-reuses the digests already on the row. The [test](tests/dlq/test_replay.py)
-takes one event through failure, replay, and a successful second upload.
-`dlq replay` with no `--id` and no filter is refused.
+`make up` takes about 20 seconds from a clean state. `make seed` should print:
+
+```
+event                                      http  expected       actual         reason
+ok 1 salesforce, click id + identifiers     202  UPLOADED       UPLOADED       matched on click id
+ok 2 hubspot, identifiers only              202  UPLOADED       UPLOADED       matched on hashed identifiers
+ok 3 salesforce, consent denied             202  SUPPRESSED     SUPPRESSED     ad_user_data_denied
+ok 4 hubspot, unparseable phone             202  REJECTED       REJECTED       unparseable:phone
+ok 5 salesforce, unknown conversion action  202  DEAD_LETTERED  DEAD_LETTERED  permanent_row:CONVERSION_ACTION_NOT_FOUND
+ok 6 event 1 delivered again                200  -              -              http 200: duplicate, no new row
+ok 7 event 1, bad signature                 401  -              -              http 401: nothing written
+
+every seeded event reached its expected state.
+```
+
+Then:
+
+```
+make dlq                                   # see event 5 in the dead-letter queue
+make logs                                  # JSON logs from api, worker, uploader
+curl localhost:8080/events/<event_id>      # lifecycle of any event
+curl localhost:8081/uploads                # what the mock platform accepted
+curl localhost:8080/metrics                # Prometheus
+make down                                  # tear down, remove volumes
+```
+
+For development without containers: `make install`, `make run` (Postgres and
+Pub/Sub only), `make migrate`, then `make api` / `make worker` / `make
+uploader` / `make mock-api` in separate shells. `make test` needs `make run`.
+
+## What happens to each seeded event
+
+**1 — Salesforce, click id and identifiers, consent granted → `UPLOADED`.**
+The API verifies `HMAC-SHA256("<timestamp>.<body>")` in constant time, maps
+the PascalCase/`__c` payload into the canonical event, and writes
+`RECEIVED → VALIDATED → QUEUED` in one transaction. After commit it publishes
+`{event_id, raw identifiers, correlation_id}` to Pub/Sub — the only place the
+raw identifiers ever travel. The worker loads the row, sees both consent
+signals `GRANTED`, runs [`build_user_identifiers`](src/gateway/normalise/identifiers.py)
+(gmail dots and `+tag` stripped, phone to E.164, name accents folded and
+title `Dr.` dropped, every value SHA-256'd), writes the digests, and moves it
+to `PROCESSED`. The uploader claims it with `FOR UPDATE SKIP LOCKED`, builds
+the platform's request row with `gclid` plus hashed `userIdentifiers` and
+`orderId = event_id`, and sends it. The mock validates every digest is
+64-char lowercase hex, accepts it, and the row is `UPLOADED`.
+
+**2 — HubSpot, identifiers only → `UPLOADED`.** Same path through a
+completely different payload shape: camelCase, integer ids, epoch
+milliseconds, every property a string. The mapper turns it into the same
+canonical event; a [test](tests/api/test_mappers.py) asserts the two sources
+produce byte-identical identifiers and consent. No click id, so
+`match_key_type` is `user_identifiers` and the request carries only the
+hashed identifiers. `+44 20 7946 0958` becomes `+442079460958` before
+hashing.
+
+**3 — Consent denied → `SUPPRESSED`.** The worker evaluates consent *before*
+touching identifiers, so a denied user's PII is never even normalised.
+`ad_user_data: DENIED` fails the gate; the row records
+`status_reason = ad_user_data_denied` and `events_suppressed_total` increments
+with that reason. The [gate](src/gateway/consent/gate.py) distinguishes
+*denied* from *unspecified* from *absent*: a spike in `_missing` means the
+client's tag stopped sending the field, which is the bug the metric exists to
+catch.
+
+**4 — Unparseable phone, no click id → `REJECTED`.** `"call me maybe"` is not
+a phone number. The normaliser returns a typed `RejectionReason` rather than
+a best-effort digest, because a hash of a badly-normalised value looks like a
+valid upload and silently matches nothing. The row is terminal with
+`status_reason = unparseable:phone`; the client sees the field name via
+`GET /events`, never the value.
+
+**5 — Unknown conversion action → `DEAD_LETTERED`.** Everything on our side
+succeeds; the platform rejects the row with `CONVERSION_ACTION_NOT_FOUND`
+because `contract_renewal` is not configured. This is the partial-failure
+path: the batch also contained events 1 and 2, which were accepted. The
+uploader maps the response's per-row results back by index, marks 1 and 2
+`UPLOADED`, and dead-letters only 5 — **the batch is never re-sent**, so 1
+and 2 are never uploaded twice. A [`dead_letters`](src/gateway/dlq/store.py)
+row holds the exact payload sent, the platform's error, and the full attempt
+history. `make dlq` shows it; once the action is configured,
+`gateway dlq replay --id 1` sends it back through the pipeline and it uploads.
+
+**6 — Event 1 delivered again → `200`, no new row.** CRMs retry. The insert
+is `ON CONFLICT DO NOTHING RETURNING` in one statement, so even concurrent
+duplicates cannot both win. The client gets the original id back and nothing
+is published.
+
+**7 — Event 1 with a bad signature → `401`, nothing written.** Unauthenticated
+bodies never touch the database. The timestamp is inside the signed string,
+so replaying a captured request with a fresh timestamp fails too.
+
+## The parts that are easy to get wrong
+
+| Problem | What this implementation does |
+| --- | --- |
+| **Hashing that silently doesn't match.** `" Mohith@Gmail.com "` and `mohith@gmail.com` hash to unrelated values; the upload succeeds and nothing matches. | Normalisation is a set of pure functions with a [fixture table](tests/normalise/test_normalise.py) of `(input, expected, digest)` rows that reads as the spec, including gmail dot/plus rules and *not* applying them to other domains. The mock rejects any digest that is not 64 lowercase hex characters. |
+| **Best-effort normalisation.** A digest of a badly-normalised phone looks like a valid attempt and drags down measurable match rate. | Every normaliser returns either the value or a typed [`RejectionReason`](src/gateway/normalise/rejection.py). A rejected record carries every failing field, not just the first. |
+| **Consent that fails open.** Missing consent fields treated as "probably fine". | Upload only on explicit `GRANTED` for both signals; *denied*, *unspecified* and *absent* are separate metric labels. |
+| **Duplicate webhooks becoming duplicate conversions.** | `event_id` is the primary key; the insert is `ON CONFLICT DO NOTHING RETURNING`. Every conversion also carries `orderId = event_id` so the platform dedupes any re-send. |
+| **Retrying the whole batch on a partial failure.** The rows that succeeded get uploaded again. | Per-row results mapped back by index; successes are `UPLOADED` and never re-claimed. A [test](tests/upload/test_uploader.py) asserts the exact order ids in every request. |
+| **Retrying permanent errors.** A 401 retried six times burns quota and delays valid traffic. | Classification at the HTTP edge, before the retry decision. Only transient classes reach tenacity (exponential backoff, full jitter, attempt and elapsed-time caps). |
+| **Replayable signatures.** A tolerance window on a timestamp header is bypassed by bumping the header. | The timestamp is inside the signed string. |
+| **Lost messages with no trace.** Ledger commit and queue publish cannot share a transaction. | Commit first, publish second; `gateway reconcile` finds `QUEUED` rows with no progress and re-enqueues the recoverable ones. |
+| **Rejections vanishing into a 4xx.** | Authenticated-but-invalid requests are written as `REJECTED` with structured reasons, queryable by id. |
+| **PII in logs.** A debug line that dumps the payload, once. | [Redaction](src/gateway/observability/logging.py) is a structlog processor on the logger and the stdlib root, not a helper call sites have to remember. |
+| **"Where is my conversion?" with no way to answer.** | One correlation id from ingest, returned to the caller, persisted, carried on the queue, bound in every process. `grep` it across three logs. |
 
 ## Observability
 
-**Metrics** are the design's section 8 list, on Prometheus, labelled by
-`source` and `conversion_action`: `events_received_total`,
-`events_rejected_total{reason}`, `events_suppressed_total{reason}`,
-`conversions_uploaded_total`, `conversions_dead_lettered_total{failure_class}`,
-`upload_latency_seconds`, `dlq_depth`, and `ingest_to_upload_seconds` —
-the number a client actually asks about. The API serves `/metrics`; the
-worker and uploader each serve their own on `METRICS_PORT`.
+Metrics (Prometheus, labelled by `source` and `conversion_action`):
+`events_received_total`, `events_rejected_total{reason}`,
+`events_suppressed_total{reason}`, `conversions_uploaded_total`,
+`conversions_dead_lettered_total{failure_class}`, `upload_latency_seconds`,
+`dlq_depth`, `ingest_to_upload_seconds`. The API serves `/metrics`; the
+worker and uploader serve their own on `:9091` and `:9092`.
 
-**Logs** are structlog JSON lines. A correlation id is generated at
-ingest, returned in the 202 body and `X-Correlation-Id` header, persisted
-on the ledger row, carried on the queue message, and bound into the log
-context of the worker and uploader — so `grep <id>` across three
-processes' logs gives the event's whole story:
-
-```
-gateway.api.routes        info     accepted
-gateway.processor         info     processed
-gateway.upload.uploader   warning  dead-lettered row
-gateway.processor         info     processed (replay, digests reused)
-gateway.upload.uploader   info     uploaded
-```
-
-**PII redaction is a processor on the logger, not a helper at call
-sites.** A call that logs a whole payload dict still cannot leak an email
-or phone number: sensitive keys are replaced wholesale, and email/phone
-patterns are scrubbed out of any string. The same processor chain is
-installed on the stdlib root logger, so lines from httpx, uvicorn and
-SQLAlchemy are JSON and redacted too. Digests (`hashed_*`) pass through.
-The [test](tests/observability/test_logging.py) logs a dict containing a
-raw email through the real configuration and asserts it comes out
-`[REDACTED]`.
+Logs are JSON lines with the correlation id on every one. The
+[runbook](docs/RUNBOOK.md) has the alert rules and what to do about each.
 
 ## Event lifecycle
-
-Every transition is written to an append-only table with a timestamp and a
-reason code, so "where did event X end up and why" is one query.
 
 ```mermaid
 stateDiagram-v2
@@ -265,117 +210,20 @@ stateDiagram-v2
     FAILED_RETRYABLE --> UPLOADING: backoff + jitter
     FAILED_RETRYABLE --> DEAD_LETTERED: attempt ceiling
     UPLOADING --> DEAD_LETTERED: permanent error
-    SUPPRESSED --> QUEUED: operator replay
     DEAD_LETTERED --> QUEUED: operator replay
     UPLOADED --> [*]
     REJECTED --> [*]
 ```
 
-The state machine is data ([`ALLOWED_TRANSITIONS`](src/gateway/models/status.py))
-and the ledger refuses any transition not listed in it.
+The state machine is [data](src/gateway/models/status.py) and the ledger
+refuses any transition not listed in it.
 
-## The parts that are easy to get wrong
-
-These are the decisions the codebase exists to demonstrate.
-
-| Problem | What this implementation does |
-| --- | --- |
-| **Hashing that silently doesn't match.** `" Mohith@Gmail.com "` and `mohith@gmail.com` hash to unrelated values; the upload succeeds and nothing matches. | Normalisation is a set of pure functions with a [fixture table](tests/normalise/test_normalise.py) of `(input, expected, digest)` rows that reads as the spec, including gmail dot/plus rules and *not* applying them to other domains. |
-| **Best-effort normalisation.** A digest of a badly-normalised phone looks like a valid attempt and drags down measurable match rate. | Every normaliser returns either the value or a typed [`RejectionReason`](src/gateway/normalise/rejection.py). A rejected record carries every failing field, not just the first. |
-| **Consent that fails open.** Missing consent fields treated as "probably fine". | The [gate](src/gateway/consent/gate.py) uploads only on explicit `GRANTED` for both signals, and distinguishes *denied* from *unspecified* from *absent* so a spike in the last one is recognisable as a broken client tag. |
-| **Duplicate webhooks becoming duplicate conversions.** CRMs retry aggressively and out of order. | `event_id` is the primary key; the insert is `ON CONFLICT DO NOTHING RETURNING` in one statement, so concurrent deliveries cannot both win. |
-| **Replayable signatures.** A tolerance window on a timestamp header is bypassed by bumping the header. | The timestamp is inside the signed string. Bumping it invalidates the signature. |
-| **Rejections vanishing into a 4xx.** A client asks why conversions are missing and there is no record. | Authenticated-but-invalid requests are written as `REJECTED` with a structured reason and are queryable at `GET /events/{id}`. |
-| **PII in logs and errors.** Pydantic's validation errors include the offending input. | Error payloads carry only field path and error type. Rejection exceptions hold the field name, never the value. |
-| **Double-processing on redelivery.** At-least-once queues redeliver; a naive worker hashes and transitions twice. | The worker reads the ledger row first and skips anything not `QUEUED`. Commit-then-ack ordering means a crash never loses work, only repeats a no-op. |
-| **Lost messages with no trace.** Ledger commit and queue publish cannot share a transaction. | Commit first, publish second. A failed publish leaves a durable `QUEUED` row that `gateway reconcile` finds and, where the match key is on the row, re-enqueues. |
-| **Retrying the whole batch on a partial failure.** The rows that succeeded get uploaded again. | Per-row results are mapped back by index; successes are `UPLOADED` and never re-claimed. A test asserts the exact order ids in every request. |
-| **Retrying permanent errors.** A 401 or a bad conversion action retried six times burns quota and delays valid traffic queued behind it. | Classification happens at the HTTP edge, before the retry decision. Only transient classes reach tenacity. |
-| **Silent hashing bugs at the platform boundary.** Wrong casing or length in a digest is accepted by a lenient mock and matches nothing in production. | The mock rejects any hashed identifier that is not 64 lowercase hex characters. |
-| **PII in logs.** A debug line that dumps the payload, once, in production. | Redaction is a structlog processor installed at the logger and on the stdlib root, not a helper call sites have to remember. |
-| **"Where is my conversion?" with no way to answer.** Three processes, three log files, no shared key. | One correlation id from ingest, persisted, carried on the queue, bound in every process; and a DLQ record that is self-contained. |
-
-## Status
-
-Built in phases, each committed separately.
-
-- [x] **Phase 1** — project skeleton, normalisation + hashing, consent gate
-- [x] **Phase 2** — ingest API and event ledger (HMAC verification, per-source schemas, idempotency, Alembic)
-- [x] **Phase 3** — queue abstraction (in-memory + Pub/Sub emulator), processing worker, reconciliation CLI
-- [x] **Phase 4** — upload client with error classification, backoff, partial-batch handling; mock ads API
-- [x] **Phase 5** — dead-letter store, replay CLI, Prometheus metrics, structlog with correlation ids and PII redaction
-- [ ] **Phase 6** — container, runbook, integration guide
-
-## Running it
-
-```
-make install     # uv sync
-make run         # docker compose up (Postgres + Pub/Sub emulator)
-make migrate     # alembic upgrade head
-make queue-init  # create the Pub/Sub topic + subscription on the emulator
-make api         # uvicorn on :8080
-make mock-api    # mock ad platform on :8081
-make worker      # gateway worker: consume, gate, hash, persist
-make uploader    # gateway uploader: claim, batch, upload, record outcomes
-make reconcile   # gateway reconcile: list events stuck in QUEUED
-make dlq         # gateway dlq list
-make test        # pytest with coverage (floor: 90%); needs `make run`
-make lint      # ruff check + format check
-make typecheck # mypy --strict
-make down      # docker compose down, removing volumes
-```
-
-Copy `.env.example` to `.env` first; every variable is documented there with
-the phase that introduces it.
-
-### API
-
-```
-POST /webhooks/crm/{salesforce|hubspot}
-X-Webhook-Timestamp: <unix seconds>
-X-Webhook-Signature: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>
-```
-
-| Response | Meaning |
-| --- | --- |
-| 202 | New event, written to the ledger as `VALIDATED` |
-| 200 | Duplicate delivery; the original event id is returned, nothing written |
-| 422 | Authenticated but invalid; written as `REJECTED` with structured reasons |
-| 401 | Signature or timestamp failed; nothing written |
-
-`GET /events/{event_id}` returns lifecycle state, reason, and every
-transition. `GET /healthz` is liveness; `GET /readyz` checks the database.
-
-### CLI
-
-```
-gateway worker                          # run the processor until SIGINT/SIGTERM
-gateway uploader                        # run the upload loop until SIGINT/SIGTERM
-gateway reconcile [--older-than 300]    # list QUEUED events with no progress; exit 1 if any
-gateway reconcile --republish           # also re-enqueue the recoverable ones
-gateway queue-init                      # create topic + subscription
-gateway dlq list [--reason X] [--source S] [--failure-class C] [--since T] [--until T]
-gateway dlq show ID
-gateway dlq replay --id ID | --reason X ...
-```
-
-### Tests
-
-Tests run against the real Postgres from `make run`, in a separate
-`gateway_test` database that is created and migrated (down, then up) each
-session. That is deliberate: the idempotency guarantee rests on Postgres'
-`ON CONFLICT` semantics, and the migration is code worth exercising.
-
-```
-362 passed · 98% line and branch coverage · mypy --strict clean
-```
-
-## Layout
+## Repository
 
 ```
 src/gateway/
 ├── api/            FastAPI app, routes, signature verification, per-source schemas, mappers
-├── models/         Canonical event, SQLAlchemy ledger models, lifecycle state machine
+├── models/         Canonical event, SQLAlchemy ledger + dead-letter models, lifecycle state machine
 ├── normalise/      Pure normalisation and hashing; rejection reasons
 ├── consent/        Consent gate
 ├── ledger.py       All ledger writes; the only code that changes event state
@@ -385,16 +233,27 @@ src/gateway/
 ├── upload/         UploadClient interface + HTTP impl, batcher, classifier, retry policy, uploader loop
 ├── dlq/            Dead-letter store and replay
 ├── observability/  Prometheus metrics; structlog config with the PII redaction processor
-├── cli.py          gateway worker | uploader | reconcile | queue-init | dlq list/show/replay (typer)
+├── cli.py          gateway worker | uploader | reconcile | queue-init | seed | dlq list/show/replay
+├── seed.py         The demo mix
 └── wiring.py       Builds the queue objects Settings asks for
 mock_ads_api/       Configurable mock of the platform's upload endpoint
 migrations/         Alembic
-tests/              Fixture tables, state machine, HTTP integration against Postgres
-docs/DESIGN.md      Technical design
+tests/              Fixture tables, state machine, HTTP integration against Postgres, end-to-end seed
+docs/               DESIGN.md · INTEGRATION_GUIDE.md · RUNBOOK.md
+Dockerfile          Multi-stage, non-root, one image for every service
+docker-compose.yml  The whole system
+.github/workflows/  Lint, typecheck, tests against Postgres + Pub/Sub emulator, image build
+```
+
+```
+make test      # 364 tests · 98% line and branch coverage · needs `make run`
+make lint      # ruff check + format check
+make typecheck # mypy --strict
 ```
 
 ## Stack
 
 Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · Alembic · Postgres ·
 Google Cloud Pub/Sub · httpx · tenacity · structlog · prometheus-client ·
-typer · phonenumbers · pytest · ruff · mypy --strict · uv · Docker Compose
+typer · phonenumbers · pytest · ruff · mypy --strict · uv · Docker Compose ·
+GitHub Actions

@@ -1,6 +1,32 @@
-# Local stack. One command brings up everything the gateway needs.
-# Later phases add the gateway, worker and mock ads API services here; the
-# `make run` / `make down` targets do not change.
+# The whole system. `make up` brings everything up; `make seed` then posts a
+# realistic mix of webhooks and reports where each one ended up.
+#
+# Two one-shot jobs (migrate, queue-init) run before the long-lived services
+# and gate them with service_completed_successfully, so a fresh checkout
+# needs no manual step between `make up` and `make seed`.
+#
+# `make run` starts only postgres and pubsub, which is what local
+# development and the test suite need.
+
+x-gateway-env: &gateway-env
+  DATABASE_URL: postgresql+psycopg://gateway:gateway@postgres:5432/gateway
+  QUEUE_BACKEND: pubsub
+  PUBSUB_EMULATOR_HOST: pubsub:8085
+  PUBSUB_PROJECT_ID: local-project
+  PUBSUB_TOPIC: lead-events
+  PUBSUB_SUBSCRIPTION: lead-events-processor
+  # Demo secrets. Real deployments inject these from a secret store; the
+  # seed command uses the same defaults so the demo signs correctly.
+  WEBHOOK_SECRET_SALESFORCE: demo-salesforce-secret
+  WEBHOOK_SECRET_HUBSPOT: demo-hubspot-secret
+  ADS_API_BASE_URL: http://mock-ads-api:8081
+  ADS_CUSTOMER_ID: "1234567890"
+  # Short batch wait and backoff so the demo settles in seconds.
+  UPLOAD_BATCH_WAIT_SECONDS: "2"
+  UPLOAD_BACKOFF_BASE_SECONDS: "0.5"
+  UPLOAD_BACKOFF_MAX_SECONDS: "5"
+  LOG_LEVEL: INFO
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -21,13 +47,103 @@ services:
   # Google Cloud Pub/Sub emulator. Speaks the real Pub/Sub API with no
   # credentials, so the same PubSubPublisher / PubSubConsumer code runs
   # locally and in production with only PUBSUB_EMULATOR_HOST changing.
-  # It has no persistence: `make queue-init` recreates the topic and
-  # subscription after every restart.
+  # It has no persistence; queue-init recreates the topic on every `up`.
   pubsub:
     image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
     command: gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --project=local-project
     ports:
       - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8085/ > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Stand-in for the ad platform. Fails on command via POST /control.
+  mock-ads-api:
+    build: .
+    image: conversion-gateway:local
+    command: uvicorn mock_ads_api.app:create_app_from_env --factory --host 0.0.0.0 --port 8081
+    environment:
+      MOCK_KNOWN_CONVERSION_ACTIONS: closed_won,qualified_lead
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: conversion-gateway:local
+    command: alembic upgrade head
+    environment: *gateway-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  queue-init:
+    image: conversion-gateway:local
+    command: gateway queue-init
+    environment: *gateway-env
+    depends_on:
+      pubsub:
+        condition: service_healthy
+
+  api:
+    image: conversion-gateway:local
+    command: uvicorn gateway.api.app:create_app_from_env --factory --host 0.0.0.0 --port 8080
+    environment: *gateway-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      queue-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    image: conversion-gateway:local
+    command: gateway worker
+    environment:
+      <<: *gateway-env
+      METRICS_PORT: "9091"
+    ports:
+      - "9091:9091"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      queue-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9091/metrics', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  uploader:
+    image: conversion-gateway:local
+    command: gateway uploader
+    environment:
+      <<: *gateway-env
+      METRICS_PORT: "9092"
+    ports:
+      - "9092:9092"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mock-ads-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9092/metrics', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres-data:

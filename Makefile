@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck fmt run down migrate api worker uploader queue-init reconcile mock-api dlq
+.PHONY: install test lint typecheck fmt run down up seed logs migrate api worker uploader queue-init reconcile mock-api dlq
 
 install:
 	uv sync
@@ -19,13 +19,24 @@ fmt:
 	uv run ruff format src tests
 	uv run ruff check --fix src tests
 
-# Bring up the local stack. Later phases add the gateway, worker and mock ads
-# API services to docker-compose.yml; the target does not change.
+# Infrastructure only (Postgres + Pub/Sub emulator): what local development
+# and `make test` need.
 run:
-	docker compose up --build -d
+	docker compose up -d postgres pubsub
+
+# The whole system in containers. Then `make seed`.
+up:
+	docker compose up --build -d --wait
+
+# Post the demo mix from inside the compose network and report outcomes.
+seed:
+	docker compose run --rm --no-deps -e SEED_API_URL=http://api:8080 api gateway seed
+
+logs:
+	docker compose logs -f api worker uploader
 
 down:
-	docker compose down --volumes
+	docker compose down --volumes --remove-orphans
 
 # Apply ledger migrations to DATABASE_URL (from .env or the environment).
 migrate:
