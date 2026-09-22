@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from gateway.api.routes import router
 from gateway.config import Settings
 from gateway.db import make_engine, make_session_factory
+from gateway.observability import configure_logging
 from gateway.queue import QueuePublisher
 from gateway.wiring import make_publisher
 
@@ -30,5 +31,6 @@ def create_app(
 def create_app_from_env() -> FastAPI:
     """Entry point for `uvicorn gateway.api.app:create_app_from_env --factory`."""
     settings = Settings()
+    configure_logging(settings.log_level)
     session_factory = make_session_factory(make_engine(settings.database_url))
     return create_app(settings, session_factory, make_publisher(settings))

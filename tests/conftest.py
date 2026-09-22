@@ -76,7 +76,7 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
     # the code under test opens its own transactions (session_factory.begin())
     # and we want those to really commit, exactly as in production.
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE event_transitions, events"))
+        conn.execute(text("TRUNCATE dead_letters, event_transitions, events RESTART IDENTITY"))
     return make_session_factory(engine)
 
 

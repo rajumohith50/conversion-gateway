@@ -13,7 +13,6 @@ Order of operations, per the design:
   3. persist digests, PROCESSED
 """
 
-import logging
 from datetime import datetime
 from enum import StrEnum
 
@@ -22,10 +21,11 @@ from gateway.consent import ConsentSignals, ConsentStatus, evaluate_consent
 from gateway.db import Session
 from gateway.models.ledger import Event
 from gateway.models.status import EventStatus
-from gateway.normalise import RejectionReason, build_user_identifiers
+from gateway.normalise import RawIdentifiers, RejectionReason, build_user_identifiers
+from gateway.observability import get_logger, metrics
 from gateway.queue import QueueMessage
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class ProcessOutcome(StrEnum):
@@ -55,16 +55,28 @@ def _consent_from_row(event: Event) -> ConsentSignals:
 def process_message(session: Session, message: QueueMessage, now: datetime) -> ProcessOutcome:
     event = ledger.get_event(session, message.event_id)
     if event is None:
-        log.warning("orphan message: no ledger row", extra={"event_id": message.event_id})
+        log.warning("orphan message: no ledger row", event_id=message.event_id)
         return ProcessOutcome.SKIPPED_UNKNOWN_EVENT
     if event.status != EventStatus.QUEUED.value:
         return ProcessOutcome.SKIPPED_NOT_QUEUED
+
+    labels = {"source": event.source, "conversion_action": metrics.unknown(event.conversion_action)}
 
     decision = evaluate_consent(_consent_from_row(event))
     if not decision.permitted:
         assert decision.reason is not None
         ledger.transition(session, event, EventStatus.SUPPRESSED, decision.reason.value, now)
+        metrics.events_suppressed_total.labels(**labels, reason=decision.reason.value).inc()
+        log.info("suppressed", event_id=event.event_id, reason=decision.reason.value)
         return ProcessOutcome.SUPPRESSED
+
+    if message.identifiers == RawIdentifiers() and event.hashed_identifiers is not None:
+        # A replayed event: the raw identifiers are gone but the digests
+        # are already on the row. Re-running the consent gate above is
+        # right; re-running normalisation on nothing would wipe them.
+        ledger.record_processed(session, event, event.hashed_identifiers, now)
+        log.info("processed (replay, digests reused)", event_id=event.event_id)
+        return ProcessOutcome.PROCESSED
 
     result = build_user_identifiers(message.identifiers)
     # A click id is itself a complete match key, so "no identifiers" is
@@ -80,7 +92,11 @@ def process_message(session: Session, message: QueueMessage, now: datetime) -> P
         # both kinds group together in the ledger.
         reason = ";".join(f"{r.reason.value}:{r.field}" for r in rejections)[:512]
         ledger.transition(session, event, EventStatus.REJECTED, reason, now)
+        for r in rejections:
+            metrics.events_rejected_total.labels(**labels, reason=r.reason.value).inc()
+        log.info("rejected", event_id=event.event_id, reason=reason)
         return ProcessOutcome.REJECTED
 
     ledger.record_processed(session, event, result.identifiers.model_dump(), now)
+    log.info("processed", event_id=event.event_id)
     return ProcessOutcome.PROCESSED

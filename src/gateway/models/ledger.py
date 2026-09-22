@@ -33,6 +33,10 @@ class Event(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     source_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Generated at ingest and threaded through every log line the event
+    # produces in any process. Persisted so the worker and uploader can
+    # bind it without the API having to pass it on the queue message alone.
+    correlation_id: Mapped[str | None] = mapped_column(String(32))
 
     # Nullable because a REJECTED row may not have parsed far enough to
     # know any of these.
@@ -90,3 +94,42 @@ class EventTransition(Base):
     event: Mapped[Event] = relationship(back_populates="transitions")
 
     __table_args__ = (Index("ix_event_transitions_event_id", "event_id"),)
+
+
+class DeadLetter(Base):
+    """One row per dead-lettering. Design section 7: the normalised payload,
+    the failure class, the platform's error, and the attempt history.
+
+    Kept after replay (replayed_at set, replay_count bumped) so the record
+    of what failed and why survives the fix. An event dead-lettered twice
+    has two rows.
+    """
+
+    __tablename__ = "dead_letters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("events.event_id", ondelete="CASCADE"), nullable=False
+    )
+    # Denormalised from events so `dlq list` filters without a join.
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    conversion_action: Mapped[str | None] = mapped_column(String(255))
+    dead_lettered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # partial | permanent | poison
+    failure_class: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    platform_error_code: Mapped[str | None] = mapped_column(String(128))
+    platform_error_message: Mapped[str | None] = mapped_column(String(1024))
+    # The exact conversion row that was (or would have been) sent: digests
+    # and unhashed-by-spec fields only. Never raw PII.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # [{"at": iso, "status": ..., "reason": ...}, ...] from the ledger's
+    # transition log, so the DLQ row is self-contained.
+    attempt_history: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replay_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_dead_letters_event_id", "event_id"),
+        Index("ix_dead_letters_open", "replayed_at", "failure_class", "dead_lettered_at"),
+    )

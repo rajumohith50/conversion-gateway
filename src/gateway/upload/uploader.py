@@ -18,17 +18,20 @@ never re-sent because some rows failed: the rows that succeeded are
 already UPLOADED and would be double-counted.
 """
 
-import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
 from sqlalchemy.orm import Session, sessionmaker
 
 from gateway import ledger
+from gateway.dlq import store as dlq
 from gateway.models.ledger import Event
-from gateway.models.status import EventStatus
+from gateway.models.status import EventStatus, Source
+from gateway.observability import get_logger, metrics
 from gateway.upload.backoff import RetryPolicy, call_with_retry
 from gateway.upload.batcher import Batcher
 from gateway.upload.classifier import FailureClass, classify_row_error
@@ -36,7 +39,7 @@ from gateway.upload.client import BatchResult, UploadClient
 from gateway.upload.conversion import build_conversion
 from gateway.upload.errors import PermanentUploadError, PoisonUploadError, TransientUploadError
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -94,12 +97,15 @@ class Uploader:
                 # individually retryable. Dead-letter it here rather than
                 # spend another request on it.
                 if event.attempt_count > self._max_row_attempts:
-                    ledger.transition(
+                    dlq.dead_letter(
                         session,
                         event,
-                        EventStatus.DEAD_LETTERED,
-                        f"poison:row_attempt_ceiling:{event.attempt_count - 1}",
-                        now,
+                        failure_class=FailureClass.POISON,
+                        reason=f"poison:row_attempt_ceiling:{event.attempt_count - 1}",
+                        error_code="row_attempt_ceiling",
+                        error_message=event.status_reason,
+                        payload=build_conversion(event, self._customer_id),
+                        now=now,
                     )
                     continue
                 claimed.append(
@@ -126,11 +132,25 @@ class Uploader:
             batch = self._batcher.flush_if_due(now)
         if not batch:
             return CycleReport()
-        return self.upload_batch(batch, now)
+        report = self.upload_batch(batch, now)
+        self._refresh_dlq_depth()
+        return report
+
+    def _refresh_dlq_depth(self) -> None:
+        with self._session_factory() as session:
+            depth = dlq.open_depth_by_source(session)
+        # Every source is set, including to zero: a source that has just
+        # had its last record replayed is absent from the GROUP BY result
+        # and would otherwise keep reporting its old depth.
+        for source in Source:
+            metrics.dlq_depth.labels(source=source.value).set(depth.get(source.value, 0))
 
     def upload_batch(self, batch: list[Claimed], now: datetime) -> CycleReport:
         event_ids = [c.event_id for c in batch]
         conversions = [c.conversion for c in batch]
+        # One batch, many events, many correlation ids: log the batch's
+        # event ids once and let each per-row outcome carry its own.
+        structlog.contextvars.bind_contextvars(batch_size=len(batch))
 
         def on_retry(exc: TransientUploadError, attempt: int) -> None:
             # Every attempt is visible in the ledger, with its reason.
@@ -139,18 +159,42 @@ class Uploader:
                     ledger.record_retry_attempt(
                         session, event, f"transient:{exc.reason}", datetime.now(UTC)
                     )
-            log.warning("upload attempt %d failed (%s); retrying", attempt, exc.reason)
+            log.warning("upload attempt failed; retrying", attempt=attempt, reason=exc.reason)
+
+        def timed_upload() -> BatchResult:
+            started = time.monotonic()
+            try:
+                result = self._client.upload(conversions)
+            except TransientUploadError:
+                metrics.upload_latency_seconds.labels(outcome="transient").observe(
+                    time.monotonic() - started
+                )
+                raise
+            except PermanentUploadError:
+                metrics.upload_latency_seconds.labels(outcome="permanent").observe(
+                    time.monotonic() - started
+                )
+                raise
+            metrics.upload_latency_seconds.labels(outcome="ok").observe(time.monotonic() - started)
+            return result
 
         try:
-            result = call_with_retry(
-                self._policy, lambda: self._client.upload(conversions), on_retry
-            )
+            result = call_with_retry(self._policy, timed_upload, on_retry)
         except PermanentUploadError as exc:
-            return self._dead_letter_all(event_ids, f"permanent:{exc.reason}", now)
+            return self._dead_letter_all(
+                batch, FailureClass.PERMANENT, f"permanent:{exc.reason}", exc.reason, str(exc), now
+            )
         except PoisonUploadError as exc:
             return self._dead_letter_all(
-                event_ids, f"poison:{exc.reason}:after_{exc.attempts}_attempts", now
+                batch,
+                FailureClass.POISON,
+                f"poison:{exc.reason}:after_{exc.attempts}_attempts",
+                exc.reason,
+                f"gave up after {exc.attempts} attempts; last error {exc.reason}",
+                now,
             )
+        finally:
+            structlog.contextvars.unbind_contextvars("batch_size")
 
         return self.apply_result(batch, result, now)
 
@@ -163,8 +207,19 @@ class Uploader:
             events = {e.event_id: e for e in _load(session, list(by_id))}
             for claimed, row in zip(batch, result.rows, strict=True):
                 event = events[claimed.event_id]
+                labels = {
+                    "source": event.source,
+                    "conversion_action": metrics.unknown(event.conversion_action),
+                }
                 if row.ok:
                     ledger.transition(session, event, EventStatus.UPLOADED, None, now)
+                    metrics.conversions_uploaded_total.labels(**labels).inc()
+                    metrics.ingest_to_upload_seconds.labels(**labels).observe(
+                        max(0.0, (now - event.received_at).total_seconds())
+                    )
+                    log.info(
+                        "uploaded", event_id=event.event_id, correlation_id=event.correlation_id
+                    )
                     uploaded += 1
                     continue
                 code = row.error_code or "UNKNOWN"
@@ -176,24 +231,52 @@ class Uploader:
                     )
                     retry_later += 1
                 else:
-                    ledger.transition(
-                        session, event, EventStatus.DEAD_LETTERED, f"permanent_row:{code}", now
+                    # Partial: the batch was accepted, this row was not.
+                    # Dead-letter it individually; the batch is not retried.
+                    dlq.dead_letter(
+                        session,
+                        event,
+                        failure_class=FailureClass.PARTIAL,
+                        reason=f"permanent_row:{code}",
+                        error_code=code,
+                        error_message=row.message,
+                        payload=claimed.conversion,
+                        now=now,
+                    )
+                    log.warning(
+                        "dead-lettered row",
+                        event_id=event.event_id,
+                        correlation_id=event.correlation_id,
+                        error_code=code,
                     )
                     dead += 1
-        log.info(
-            "batch done: %d uploaded, %d retry later, %d dead-lettered",
-            uploaded,
-            retry_later,
-            dead,
-        )
+        log.info("batch done", uploaded=uploaded, retry_later=retry_later, dead_lettered=dead)
         return CycleReport(uploaded=uploaded, retry_later=retry_later, dead_lettered=dead)
 
-    def _dead_letter_all(self, event_ids: list[str], reason: str, now: datetime) -> CycleReport:
+    def _dead_letter_all(
+        self,
+        batch: list[Claimed],
+        failure_class: FailureClass,
+        reason: str,
+        error_code: str,
+        error_message: str,
+        now: datetime,
+    ) -> CycleReport:
+        by_id = {c.event_id: c for c in batch}
         with self._session_factory.begin() as session:
-            for event in _load(session, event_ids):
-                ledger.transition(session, event, EventStatus.DEAD_LETTERED, reason, now)
-        log.error("batch of %d dead-lettered: %s", len(event_ids), reason)
-        return CycleReport(dead_lettered=len(event_ids))
+            for event in _load(session, list(by_id)):
+                dlq.dead_letter(
+                    session,
+                    event,
+                    failure_class=failure_class,
+                    reason=reason,
+                    error_code=error_code,
+                    error_message=error_message,
+                    payload=by_id[event.event_id].conversion,
+                    now=now,
+                )
+        log.error("batch dead-lettered", count=len(batch), reason=reason)
+        return CycleReport(dead_lettered=len(batch))
 
 
 def _load(session: Session, event_ids: list[str]) -> list[Event]:

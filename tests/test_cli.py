@@ -42,7 +42,7 @@ def test_reconcile_lists_only_events_older_than_threshold(
     text = out.getvalue()
     assert "salesforce:old" in text
     assert "salesforce:fresh" not in text
-    assert "recoverable (click id)" in text
+    assert "recoverable; rerun with --republish" in text
 
 
 def test_reconcile_distinguishes_recoverable_from_needs_resend(
@@ -81,28 +81,25 @@ def test_reconcile_republish_recovers_click_id_events_end_to_end(
         assert left.status == "QUEUED"
 
 
-def test_parser() -> None:
-    p = cli.build_parser()
-    assert p.parse_args(["worker"]).command == "worker"
-    args = p.parse_args(["reconcile", "--older-than", "60", "--republish"])
-    assert (args.command, args.older_than, args.republish) == ("reconcile", 60, True)
-    assert p.parse_args(["queue-init"]).command == "queue-init"
-
-
 def test_queue_init_is_a_noop_for_memory_backend() -> None:
     out = io.StringIO()
     cli.queue_init(Settings(queue_backend="memory"), out)
     assert "nothing to create" in out.getvalue()
 
 
-def test_main_reconcile_exit_code(
-    session_factory: sessionmaker[Session], monkeypatch, capsys
-) -> None:  # type: ignore[no-untyped-def]
+def test_reconcile_command_exit_code(
+    session_factory: sessionmaker[Session],
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    from typer.testing import CliRunner
+
     from tests.conftest import TEST_URL
 
     monkeypatch.setenv("DATABASE_URL", TEST_URL)
     monkeypatch.setenv("QUEUE_BACKEND", "memory")
-    assert cli.main(["reconcile"]) == 0
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["reconcile"]).exit_code == 0
     _stuck(session_factory, "old", age=100_000)
-    assert cli.main(["reconcile", "--older-than", "60"]) == 1
-    assert "salesforce:old" in capsys.readouterr().out
+    result = runner.invoke(cli.app, ["reconcile", "--older-than", "60"])
+    assert result.exit_code == 1
+    assert "salesforce:old" in result.output

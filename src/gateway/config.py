@@ -68,3 +68,9 @@ class Settings(BaseSettings):
     upload_row_retry_after_seconds: int = Field(default=60, ge=0)
     upload_stale_after_seconds: int = Field(default=600, ge=1)
     upload_poll_interval_seconds: float = Field(default=1.0, gt=0)
+
+    # Observability.
+    log_level: str = "INFO"
+    # Worker and uploader processes serve their Prometheus registry here;
+    # the API serves its own at /metrics on its normal port.
+    metrics_port: int = Field(default=9090, ge=1, le=65535)

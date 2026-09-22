@@ -24,6 +24,8 @@ class CanonicalLeadEvent(BaseModel):
     event_id: str
     source: Source
     source_event_id: str
+    # Assigned by the ingest route; see gateway.observability.logging.
+    correlation_id: str | None = None
 
     conversion_action: str
     # When the outcome happened in the CRM, not when we received it.

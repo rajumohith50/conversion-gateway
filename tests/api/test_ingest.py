@@ -36,13 +36,18 @@ def test_salesforce_valid_payload(
     resp = _post(client, "salesforce", body, SALESFORCE_SECRET)
 
     assert resp.status_code == 202
-    assert resp.json() == {"event_id": "salesforce:e-sf-0001", "status": "QUEUED"}
+    body = resp.json()
+    assert body["event_id"] == "salesforce:e-sf-0001"
+    assert body["status"] == "QUEUED"
+    assert len(body["correlation_id"]) == 32
+    assert resp.headers["X-Correlation-Id"] == body["correlation_id"]
 
     with session_factory() as session:
         row = ledger.get_event(session, "salesforce:e-sf-0001")
         assert row is not None
         assert row.status == "QUEUED"
         assert row.source == "salesforce"
+        assert row.correlation_id == body["correlation_id"]
         assert row.conversion_action == "closed_won"
         assert row.match_key_type == "click_id"
         assert row.consent_ad_user_data == "GRANTED"
@@ -59,7 +64,8 @@ def test_hubspot_valid_payload(client: TestClient, session_factory: sessionmaker
     resp = _post(client, "hubspot", body, HUBSPOT_SECRET)
 
     assert resp.status_code == 202
-    assert resp.json() == {"event_id": "hubspot:987654321", "status": "QUEUED"}
+    assert resp.json()["event_id"] == "hubspot:987654321"
+    assert resp.json()["status"] == "QUEUED"
 
     with session_factory() as session:
         row = ledger.get_event(session, "hubspot:987654321")

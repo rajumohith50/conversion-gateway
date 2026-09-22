@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck fmt run down migrate api worker uploader queue-init reconcile mock-api
+.PHONY: install test lint typecheck fmt run down migrate api worker uploader queue-init reconcile mock-api dlq
 
 install:
 	uv sync
@@ -41,13 +41,16 @@ queue-init:
 	uv run gateway queue-init
 
 worker:
-	uv run gateway worker
+	METRICS_PORT=9091 uv run gateway worker
 
 reconcile:
 	uv run gateway reconcile
 
+dlq:
+	uv run gateway dlq list
+
 uploader:
-	uv run gateway uploader
+	METRICS_PORT=9092 uv run gateway uploader
 
 # The mock ad platform, on the port .env.example points ADS_API_BASE_URL at.
 mock-api:

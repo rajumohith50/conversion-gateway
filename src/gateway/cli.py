@@ -1,36 +1,49 @@
-"""Operator commands. `gateway <command>` after `uv sync`.
+"""Operator commands. `gateway --help` after `uv sync`.
 
-    worker       run the processing loop until SIGINT/SIGTERM
-    uploader     run the upload loop until SIGINT/SIGTERM
-    reconcile    list events stuck in QUEUED; optionally re-enqueue the
-                 ones that can be
-    queue-init   create the Pub/Sub topic and subscription
+    worker                 run the processing loop until SIGINT/SIGTERM
+    uploader               run the upload loop until SIGINT/SIGTERM
+    reconcile              list events stuck in QUEUED; --republish the
+                           recoverable ones
+    queue-init             create the Pub/Sub topic and subscription
+    dlq list               dead-lettered events, filterable
+    dlq show ID            one dead-letter record in full
+    dlq replay             re-enqueue by --id or by the same filters as list
 
-Each command is a plain function taking its dependencies as arguments, so
-tests call the function; main() only parses arguments and builds objects.
+Every command body is a plain function taking its dependencies as
+arguments so tests call the function; the typer layer only parses
+arguments and builds objects.
 """
 
-import argparse
-import logging
+import json
 import signal
 import sys
 import threading
 from datetime import UTC, datetime, timedelta
-from typing import TextIO
+from typing import Annotated, TextIO
 
+import typer
 from sqlalchemy.orm import Session, sessionmaker
 
 from gateway import ledger, worker
 from gateway.config import Settings
 from gateway.db import make_engine, make_session_factory
+from gateway.dlq import store as dlq_store
 from gateway.models.status import MatchKeyType
 from gateway.normalise import RawIdentifiers
+from gateway.observability import configure_logging, metrics
 from gateway.queue import QueueConsumer, QueueMessage, QueuePublisher
 from gateway.upload import uploader as upload_loop
 from gateway.upload.backoff import RetryPolicy
 from gateway.upload.client import HttpUploadClient
 from gateway.upload.uploader import Uploader
 from gateway.wiring import make_consumer, make_publisher
+
+app = typer.Typer(add_completion=False, no_args_is_help=True)
+dlq_app = typer.Typer(no_args_is_help=True, help="Inspect and replay dead-lettered events.")
+app.add_typer(dlq_app, name="dlq")
+
+
+# --- Long-running processes ---------------------------------------------------
 
 
 def _stop_on_signal() -> threading.Event:
@@ -46,6 +59,7 @@ def _stop_on_signal() -> threading.Event:
 def run_worker(
     consumer: QueueConsumer, session_factory: sessionmaker[Session], settings: Settings
 ) -> None:
+    metrics.serve_metrics(settings.metrics_port)
     worker.run(
         consumer,
         session_factory,
@@ -79,11 +93,15 @@ def build_uploader(session_factory: sessionmaker[Session], settings: Settings) -
 
 
 def run_uploader(session_factory: sessionmaker[Session], settings: Settings) -> None:
+    metrics.serve_metrics(settings.metrics_port)
     upload_loop.run(
         build_uploader(session_factory, settings),
         _stop_on_signal(),
         settings.upload_poll_interval_seconds,
     )
+
+
+# --- reconcile ----------------------------------------------------------------
 
 
 def reconcile(
@@ -109,7 +127,8 @@ def reconcile(
                 e.event_id,
                 e.source,
                 int((now - e.received_at).total_seconds()),
-                e.match_key_type == MatchKeyType.CLICK_ID.value,
+                e.match_key_type == MatchKeyType.CLICK_ID.value or e.hashed_identifiers is not None,
+                e.correlation_id,
             )
             for e in stuck
         ]
@@ -120,20 +139,107 @@ def reconcile(
 
     out.write(f"{'event_id':<40} {'source':<11} {'age_s':>7}  action\n")
     republished = 0
-    for event_id, source, age, recoverable in rows:
+    for event_id, source, age, recoverable, correlation_id in rows:
         if recoverable and republish:
             publisher.publish(
-                QueueMessage(event_id=event_id, identifiers=RawIdentifiers(), enqueued_at=now)
+                QueueMessage(
+                    event_id=event_id,
+                    identifiers=RawIdentifiers(),
+                    enqueued_at=now,
+                    correlation_id=correlation_id,
+                )
             )
             action = "republished"
             republished += 1
         elif recoverable:
-            action = "recoverable (click id); rerun with --republish"
+            action = "recoverable; rerun with --republish"
         else:
             action = "needs CRM resend (identifiers not retained)"
         out.write(f"{event_id:<40} {source:<11} {age:>7}  {action}\n")
     out.write(f"{len(rows)} stuck, {republished} republished\n")
     return len(rows)
+
+
+# --- dlq ----------------------------------------------------------------------
+
+
+def dlq_list(session_factory: sessionmaker[Session], flt: dlq_store.DlqFilter, out: TextIO) -> int:
+    with session_factory() as session:
+        rows = dlq_store.list_dead_letters(session, flt)
+        if not rows:
+            out.write("no dead-lettered events match\n")
+            return 0
+        out.write(
+            f"{'id':>6}  {'dead_lettered_at':<25} {'source':<11} {'class':<9} "
+            f"{'event_id':<32} reason\n"
+        )
+        for r in rows:
+            replayed = " (replayed)" if r.replayed_at else ""
+            out.write(
+                f"{r.id:>6}  {r.dead_lettered_at.isoformat(timespec='seconds'):<25} "
+                f"{r.source:<11} {r.failure_class:<9} {r.event_id:<32} {r.reason}{replayed}\n"
+            )
+        out.write(f"{len(rows)} shown\n")
+        return len(rows)
+
+
+def dlq_show(session_factory: sessionmaker[Session], dlq_id: int, out: TextIO) -> bool:
+    with session_factory() as session:
+        row = dlq_store.get_dead_letter(session, dlq_id)
+        if row is None:
+            out.write(f"no dead-letter record {dlq_id}\n")
+            return False
+        record = {
+            "id": row.id,
+            "event_id": row.event_id,
+            "source": row.source,
+            "conversion_action": row.conversion_action,
+            "dead_lettered_at": row.dead_lettered_at.isoformat(),
+            "failure_class": row.failure_class,
+            "reason": row.reason,
+            "platform_error_code": row.platform_error_code,
+            "platform_error_message": row.platform_error_message,
+            "replayed_at": row.replayed_at.isoformat() if row.replayed_at else None,
+            "replay_count": row.replay_count,
+            "payload": row.payload,
+            "attempt_history": row.attempt_history,
+        }
+        out.write(json.dumps(record, indent=2) + "\n")
+        return True
+
+
+def dlq_replay(
+    session_factory: sessionmaker[Session],
+    publisher: QueuePublisher,
+    flt: dlq_store.DlqFilter,
+    dlq_id: int | None,
+    now: datetime,
+    out: TextIO,
+) -> int:
+    """Replay one record by id, or every open record matching the filter.
+    Returns how many were replayed. Each replay is its own transaction so
+    a publish failure on one does not roll back the others."""
+    with session_factory() as session:
+        if dlq_id is not None:
+            row = dlq_store.get_dead_letter(session, dlq_id)
+            candidates = [row.id] if row else []
+        else:
+            candidates = [r.id for r in dlq_store.list_dead_letters(session, flt, limit=1000)]
+
+    replayed = 0
+    for candidate in candidates:
+        with session_factory.begin() as session:
+            row = dlq_store.get_dead_letter(session, candidate)
+            assert row is not None
+            if dlq_store.replay(session, row, publisher, now):
+                out.write(f"replayed {row.id} {row.event_id}\n")
+                replayed += 1
+            else:
+                out.write(
+                    f"skipped  {row.id} {row.event_id} (already replayed or not dead-lettered)\n"
+                )
+    out.write(f"{replayed} replayed of {len(candidates)} candidates\n")
+    return replayed
 
 
 def queue_init(settings: Settings, out: TextIO) -> None:
@@ -150,49 +256,135 @@ def queue_init(settings: Settings, out: TextIO) -> None:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="gateway")
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("worker", help="consume the queue and process events")
-    sub.add_parser("uploader", help="upload PROCESSED events to the ad platform")
-    rec = sub.add_parser("reconcile", help="find events stuck in QUEUED")
-    rec.add_argument("--older-than", type=int, default=None, metavar="SECONDS")
-    rec.add_argument("--republish", action="store_true")
-    sub.add_parser("queue-init", help="create the Pub/Sub topic and subscription")
-    return parser
+# --- typer layer --------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _settings() -> Settings:
     settings = Settings()
-    # Plain stdlib logging until phase 6 replaces it with structlog and the
-    # PII redaction filter. Nothing logged today carries identifiers.
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging(settings.log_level)
+    return settings
 
-    if args.command == "queue-init":
-        queue_init(settings, sys.stdout)
-        return 0
 
-    session_factory = make_session_factory(make_engine(settings.database_url))
-    if args.command == "worker":
-        run_worker(make_consumer(settings), session_factory, settings)
-        return 0
-    if args.command == "uploader":
-        run_uploader(session_factory, settings)
-        return 0
+def _session_factory(settings: Settings) -> sessionmaker[Session]:
+    return make_session_factory(make_engine(settings.database_url))
 
-    older_than = args.older_than or settings.reconcile_stuck_after_seconds
+
+def _parse_when(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+@app.command("worker")
+def worker_cmd() -> None:
+    """Consume the queue and process events."""
+    settings = _settings()
+    run_worker(make_consumer(settings), _session_factory(settings), settings)
+
+
+@app.command("uploader")
+def uploader_cmd() -> None:
+    """Upload PROCESSED events to the ad platform."""
+    settings = _settings()
+    run_uploader(_session_factory(settings), settings)
+
+
+@app.command("reconcile")
+def reconcile_cmd(
+    older_than: Annotated[int | None, typer.Option(help="Seconds; default from settings")] = None,
+    republish: Annotated[bool, typer.Option(help="Re-enqueue recoverable events")] = False,
+) -> None:
+    """Find events stuck in QUEUED. Exit 1 if any."""
+    settings = _settings()
     found = reconcile(
-        session_factory,
+        _session_factory(settings),
         make_publisher(settings),
-        older_than,
-        args.republish,
+        older_than or settings.reconcile_stuck_after_seconds,
+        republish,
         datetime.now(UTC),
         sys.stdout,
     )
-    # Non-zero when something is stuck, so a cron job or CI check can alert.
-    return 1 if found else 0
+    raise typer.Exit(code=1 if found else 0)
+
+
+@app.command("queue-init")
+def queue_init_cmd() -> None:
+    """Create the Pub/Sub topic and subscription."""
+    queue_init(_settings(), sys.stdout)
+
+
+def _filter_options(
+    source: str | None,
+    failure_class: str | None,
+    reason: str | None,
+    since: str | None,
+    until: str | None,
+    include_replayed: bool,
+) -> dlq_store.DlqFilter:
+    return dlq_store.DlqFilter(
+        source=source,
+        failure_class=failure_class,
+        reason_prefix=reason,
+        since=_parse_when(since),
+        until=_parse_when(until),
+        include_replayed=include_replayed,
+    )
+
+
+@dlq_app.command("list")
+def dlq_list_cmd(
+    source: Annotated[str | None, typer.Option()] = None,
+    failure_class: Annotated[str | None, typer.Option(help="partial | permanent | poison")] = None,
+    reason: Annotated[str | None, typer.Option(help="Prefix match, e.g. permanent_row:")] = None,
+    since: Annotated[str | None, typer.Option(help="ISO 8601")] = None,
+    until: Annotated[str | None, typer.Option(help="ISO 8601")] = None,
+    include_replayed: Annotated[bool, typer.Option()] = False,
+) -> None:
+    """List dead-lettered events, newest first."""
+    settings = _settings()
+    flt = _filter_options(source, failure_class, reason, since, until, include_replayed)
+    dlq_list(_session_factory(settings), flt, sys.stdout)
+
+
+@dlq_app.command("show")
+def dlq_show_cmd(dlq_id: int) -> None:
+    """Show one dead-letter record as JSON."""
+    settings = _settings()
+    if not dlq_show(_session_factory(settings), dlq_id, sys.stdout):
+        raise typer.Exit(code=1)
+
+
+@dlq_app.command("replay")
+def dlq_replay_cmd(
+    id: Annotated[int | None, typer.Option("--id", help="One record by id")] = None,  # noqa: A002
+    source: Annotated[str | None, typer.Option()] = None,
+    failure_class: Annotated[str | None, typer.Option()] = None,
+    reason: Annotated[str | None, typer.Option(help="Prefix match")] = None,
+    since: Annotated[str | None, typer.Option()] = None,
+    until: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    """Re-enqueue dead-lettered events, by --id or by filter."""
+    if id is None and not any((source, failure_class, reason, since, until)):
+        # Replaying everything by accident is the one mistake this command
+        # must not allow.
+        typer.echo("refusing to replay with no --id and no filter", err=True)
+        raise typer.Exit(code=2)
+    settings = _settings()
+    flt = _filter_options(source, failure_class, reason, since, until, include_replayed=False)
+    dlq_replay(
+        _session_factory(settings),
+        make_publisher(settings),
+        flt,
+        id,
+        datetime.now(UTC),
+        sys.stdout,
+    )
+
+
+def main() -> None:
+    app()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

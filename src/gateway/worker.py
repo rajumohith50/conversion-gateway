@@ -8,16 +8,17 @@ makes delivery at-least-once: a crash between the two redelivers a message
 whose row is already PROCESSED, and process_message() skips it.
 """
 
-import logging
 import threading
 from datetime import UTC, datetime
 
+import structlog
 from sqlalchemy.orm import Session, sessionmaker
 
+from gateway.observability import get_logger
 from gateway.processor import ProcessOutcome, process_message
 from gateway.queue import Delivery, QueueConsumer
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def handle_delivery(
@@ -25,19 +26,22 @@ def handle_delivery(
 ) -> ProcessOutcome | None:
     """Process one delivery. Returns the outcome, or None if processing
     raised and the message was nacked."""
+    # The correlation id from ingest joins this process's lines to the
+    # API's. Cleared afterwards so it cannot leak onto the next message.
+    structlog.contextvars.bind_contextvars(
+        correlation_id=delivery.message.correlation_id, event_id=delivery.message.event_id
+    )
     try:
         with session_factory.begin() as session:
             outcome = process_message(session, delivery.message, datetime.now(UTC))
     except Exception:
-        log.exception(
-            "processing failed, nacking",
-            extra={"event_id": delivery.message.event_id, "attempt": delivery.attempt},
-        )
+        log.exception("processing failed, nacking", attempt=delivery.attempt)
         consumer.nack(delivery)
         return None
+    finally:
+        structlog.contextvars.clear_contextvars()
 
     consumer.ack(delivery)
-    log.info("processed", extra={"event_id": delivery.message.event_id, "outcome": outcome.value})
     return outcome
 
 

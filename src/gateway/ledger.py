@@ -98,6 +98,7 @@ def record_validated(session: Session, event: CanonicalLeadEvent, now: datetime)
             "source": event.source.value,
             "source_event_id": event.source_event_id,
             "received_at": now,
+            "correlation_id": event.correlation_id,
             "conversion_action": event.conversion_action,
             "conversion_time": event.conversion_time,
             "conversion_value": event.conversion_value,
