@@ -313,7 +313,10 @@ def readyz(request: Request, response: Response) -> dict[str, str]:
     try:
         with session_factory() as session:
             session.execute(text("SELECT 1"))
-    except Exception:  # noqa: BLE001 - any failure means not ready
+    except Exception as exc:  # noqa: BLE001 - any failure means not ready
+        # The response stays generic (no connection strings to a caller),
+        # but the log says what actually went wrong.
+        log.warning("readiness check failed", error=type(exc).__name__, detail=str(exc)[:200])
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "unavailable", "database": "unreachable"}
     return {"status": "ok", "database": "ok"}
