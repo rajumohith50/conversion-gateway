@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger from the Actions tab or `gh workflow run ci`.
+  workflow_dispatch:
 
 jobs:
   checks:
