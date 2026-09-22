@@ -386,8 +386,7 @@ src/gateway/
 ├── dlq/            Dead-letter store and replay
 ├── observability/  Prometheus metrics; structlog config with the PII redaction processor
 ├── cli.py          gateway worker | uploader | reconcile | queue-init | dlq list/show/replay (typer)
-├── wiring.py       Builds the queue objects Settings asks for
-└── observability/  (phase 6)
+└── wiring.py       Builds the queue objects Settings asks for
 mock_ads_api/       Configurable mock of the platform's upload endpoint
 migrations/         Alembic
 tests/              Fixture tables, state machine, HTTP integration against Postgres
